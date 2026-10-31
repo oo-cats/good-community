@@ -1,4 +1,5 @@
 import Component from 'flarum/common/Component';
+import SubjectPicker from './SubjectPicker';
 import { uuid, localDate, utcDate, fieldLabel } from './api';
 
 export function select(value, options, change, label, disabled = false) {
@@ -10,6 +11,7 @@ export function checks(items, chosen, change, title) {
   return m('.Community-checks', { role: 'group', 'aria-label': title }, items.map(item => m('label.checkbox', [m('input', { type: 'checkbox', checked: chosen.some(id => String(id) === String(item.id)), onchange: event => change(event.target.checked ? [...chosen, item.id] : chosen.filter(id => String(id) !== String(item.id))) }), item.name])));
 }
 export function literal(type, value, change, field = {}) {
+  if (field.choices) return select(value || '', [['', '选择值'], ...field.choices], change, '比较值');
   if (type === 'boolean') return select(String(value ?? true), [['true', '是'], ['false', '否']], value => change(value === 'true'), '布尔值');
   if (type === 'enum') return select(value?.id || value || '', [['', '选择值'], ...(field.options || []).map(option => [option.id, option.name])], change, '枚举值');
   if (type === 'set') return checks(field.options || [], Array.isArray(value) ? value : [], change, '集合值');
@@ -24,16 +26,20 @@ export function newAtom(method = 'query.posts.count.v1') {
 export function newGoal() { const atom = newAtom(); return { goal: [[{ atom_id: atom.atom_id, negated: false }]], atoms: [atom] }; }
 
 export class QueryEditor extends Component {
-  oninit(vnode) { super.oninit(vnode); const query = this.attrs.query; query.time ||= { mode: 'inherit', field: 'post.created_at' }; query.board_tags ||= { ids: [], match: 'any', include_descendants: false }; query.admin_tags ||= { option_ids: [] }; if (!query.where?.length) query.where = [[newTerm()]]; }
+  term() { return this.attrs.fields ? { left: { field: this.attrs.fields[0].id }, operator: '=', right: { literal: '' }, negated: false } : newTerm(); }
+  oninit(vnode) { super.oninit(vnode); const query = this.attrs.query; query.time ||= { mode: 'inherit', field: 'post.created_at' }; query.board_tags ||= { ids: [], match: 'any', include_descendants: false }; query.admin_tags ||= { option_ids: [] }; if (!query.where?.length) query.where = [[this.term()]]; }
   view() {
     const { query, meta } = this.attrs;
-    const fields = [...Object.entries(meta.system_fields || {}).map(([id, type]) => ({ id, name: fieldLabel(meta, id), value_type: type })), ...(meta.fields || []).filter(field => field.rule_enabled && field.state === 'active')];
+    const fields = this.attrs.fields || [...Object.entries(meta.system_fields || {}).map(([id, type]) => ({ id, name: fieldLabel(meta, id), value_type: type })), ...(meta.fields || []).filter(field => field.rule_enabled && field.state === 'active')];
     return m('.Community-query', [
-      m('.Community-row', [label('统计对象', select(query.post_type || 'all', [['all', '全部帖子'], ['topic', '仅主题首帖'], ['reply', '仅回复']], value => query.post_type = value, '统计对象')), label('统计时间', select(query.time.mode, [['inherit', '跟随任务当前周期'], ['fixed', '手动时间范围']], value => query.time = { mode: value, field: 'post.created_at', start: null, end: null }, '统计时间'))]),
+      !this.attrs.sourceOnly && [m('.Community-row', [label('统计对象', select(query.post_type || 'all', [['all', '全部帖子'], ['topic', '仅主题首帖'], ['reply', '仅回复']], value => query.post_type = value, '统计对象')), label('统计时间', select(query.time.mode, [['inherit', this.attrs.inheritLabel || '跟随任务当前周期'], ...(!this.attrs.periodic ? [['fixed', '手动时间范围']] : [])], value => query.time = { mode: value, field: 'post.created_at', start: null, end: null }, '统计时间'))]),
+      this.attrs.periodic && query.time.mode !== 'inherit' && m('.Community-error', ['周期任务必须统计当期的新内容。', m('button.Button', { type: 'button', onclick: () => query.time = { mode: 'inherit' } }, '改为当前周期')]),
       query.time.mode === 'fixed' && m('.Community-row', [label('从', input(localDate(query.time.start), value => query.time.start = utcDate(value), { type: 'datetime-local' })), label('至', input(localDate(query.time.end), value => query.time.end = utcDate(value), { type: 'datetime-local' })), m('.helpText', '空边界表示不限；手动范围独立于任务时间。')]),
       meta.board_tags?.length > 0 && m('details.Community-detail', [m('summary', `版面范围：${query.board_tags.ids.length ? `${query.board_tags.ids.length} 个标签` : '不限'}`), checks(meta.board_tags, query.board_tags.ids.map(String), value => query.board_tags.ids = value.map(Number), '版面标签'), select(query.board_tags.match, [['any', '满足任一标签'], ['all', '满足全部标签']], value => query.board_tags.match = value, '版面匹配方式'), m('label.checkbox', [m('input', { type: 'checkbox', checked: query.board_tags.include_descendants, onchange: event => query.board_tags.include_descendants = event.target.checked }), '包含子分类'])]),
-      m('label.checkbox', [m('input', { type: 'checkbox', checked: query.unfiltered, onchange: event => query.unfiltered = event.target.checked }), '不限制帖子字段']),
-      !query.unfiltered && m('.Community-filter', [m('p.helpText', '逐帖筛选：同一子式内同时满足；任一子式满足即可计数。'), query.where.map((clause, ci) => m('.Community-clause', [
+      !this.attrs.disableRelations && m('details.Community-detail', [m('summary', '关联 ACGN 作品'), m('label.checkbox', [m('input', { type: 'checkbox', checked: !!query.relations?.acgn, onchange: event => query.relations = event.target.checked ? { acgn: { subjects: { types: [], ids: [] }, where: [] } } : {} }), '只统计关联指定作品条件的帖子']), query.relations?.acgn && m(AcgnEditor, { params: query.relations.acgn, meta, app: this.attrs.app, schema: meta.methods.find(item => item.method === 'acgn.records.count.v1'), relationOnly: true })]),
+      ],
+      m('label.checkbox', [m('input', { type: 'checkbox', checked: query.unfiltered, onchange: event => query.unfiltered = event.target.checked }), this.attrs.sourceOnly ? '不限制作品字段' : '不限制帖子字段']),
+      !query.unfiltered && m('.Community-filter', [m('p.helpText', '同一子式内同时满足；任一子式满足即可计数。'), query.where.map((clause, ci) => m('.Community-clause', [
         m('.Community-clauseHeading', [m('strong', `子式 ${ci + 1}`), query.where.length > 1 && m('button.Button.Button--text', { type: 'button', onclick: () => query.where.splice(ci, 1), 'aria-label': `删除筛选子式${ci + 1}` }, '删除子式')]),
         clause.map((term, ti) => {
           const field = fields.find(field => field.id === term.left.field) || fields[0]; const type = field?.value_type || 'string';
@@ -47,8 +53,30 @@ export class QueryEditor extends Component {
             clause.length > 1 && m('button.Button.Button--text', { type: 'button', onclick: () => clause.splice(ti, 1), 'aria-label': `删除筛选项${ti + 1}` }, '删除项'),
           ]);
         }),
-        m('button.Button.Button--text', { type: 'button', onclick: () => clause.push(newTerm()) }, '+ 添加项'),
-      ])), m('button.Button', { type: 'button', onclick: () => query.where.push([newTerm()]) }, '+ 添加子式')]),
+        m('button.Button.Button--text', { type: 'button', onclick: () => clause.push(this.term()) }, '+ 添加项'),
+      ])), m('button.Button', { type: 'button', onclick: () => query.where.push([this.term()]) }, '+ 添加子式')]),
+    ]);
+  }
+}
+
+class AcgnEditor extends Component {
+  oninit(vnode) { super.oninit(vnode); const params = this.attrs.params; params.subjects ||= { types: [], ids: [] }; this.filter = { unfiltered: !params.where?.length, where: params.where || [] }; }
+  view() {
+    const { params, schema, meta, app, periodic, relationOnly } = this.attrs;
+    const first = schema?.temporal === 'action';
+    params.where = this.filter.unfiltered ? [] : this.filter.where;
+    if (first) params.time ||= { mode: 'inherit' };
+    const fields = Object.entries(schema?.query_fields || {}).map(([id, field]) => ({ id, name: field.title, value_type: field.type, choices: field.choices }));
+    return m('.Community-acgn', [
+      label('作品类型', checks([{ id: 'anime', name: '动画' }, { id: 'manga', name: '漫画' }, { id: 'game', name: '游戏' }, { id: 'novel', name: '小说' }], params.subjects.types, values => params.subjects.types = values, '作品类型'), '不勾选表示不限类型。'),
+      app && m(SubjectPicker, { app, ids: params.subjects.ids, onchange: ids => params.subjects.ids = ids }),
+      first && [label('首次完成时间', select(params.time.mode, [['inherit', '跟随任务当前周期'], ...(!periodic ? [['fixed', '手动时间范围'], ['all', '全部时间']] : [])], mode => params.time = { mode }, '首次完成时间')),
+        periodic && params.time.mode !== 'inherit' && m('.Community-error', ['周期任务须统计当期首次完成。', m('button.Button', { type: 'button', onclick: () => params.time = { mode: 'inherit' } }, '改为当前周期')]),
+        params.time.mode === 'fixed' && m('.Community-row', [label('从', input(localDate(params.time.start), value => params.time.start = utcDate(value), { type: 'datetime-local' })), label('至', input(localDate(params.time.end), value => params.time.end = utcDate(value), { type: 'datetime-local' }))])],
+      fields.length > 0 && m(QueryEditor, { query: this.filter, meta, fields, sourceOnly: true }),
+      !relationOnly && [m('label.checkbox', [m('input', { type: 'checkbox', checked: !!params.related_posts?.required, onchange: event => { if (event.target.checked) params.related_posts = { required: true, association: 'single_subject', query: { ...newQuery(), post_type: 'topic' } }; else delete params.related_posts; } }), '每部作品还须有本人发表的合格文章']),
+        params.related_posts?.required && [m('p.helpText', '按作品去重；文章须只关联这一部作品。多篇文章不会把同一作品重复计数。'), m(QueryEditor, { query: params.related_posts.query, meta, app, periodic: true, disableRelations: true, inheritLabel: first ? '与首次完成使用相同时间范围' : '全部时间（当前状态条件）' })]],
+      !first && m('p.helpText', '统计当前状态，导入的收藏也可计入；在周期任务中表示每期保持条件。'),
     ]);
   }
 }
@@ -60,7 +88,8 @@ export default class GoalEditor extends Component {
   parameters(spec, model, meta) {
     const method = spec.method; const params = spec.params ||= {}; const schema = meta.methods.find(item => item.method === method);
     return [
-      method === 'query.posts.count.v1' && m('details.Community-detail', [m('summary', '筛选哪些帖子'), m(QueryEditor, { query: params.query ||= newQuery(), meta })]),
+      method === 'query.posts.count.v1' && m('details.Community-detail', [m('summary', '筛选哪些帖子'), m(QueryEditor, { query: params.query ||= newQuery(), meta, app: this.attrs.app, periodic: Number(model.period) > 0 })]),
+      schema?.editor === 'acgn' && m('.Community-acgnParameters', [m(AcgnEditor, { key: method, params, schema, meta, app: this.attrs.app, periodic: Number(model.period) > 0 })]),
       method === 'achievements.held.v1' && label('指定成就', select(params.achievement_id || '', [['', '选择成就'], ...this.references.achievements.map(item => [item.id, item.name])], value => params.achievement_id = value, '指定成就')),
       ['tasks.completed.v1', 'tasks.completed_periods.count.v1', 'tasks.completed.count.v1'].includes(method) && [
         m('.Community-row', [input(this.taskSearch || '', value => this.taskSearch = value, { placeholder: '按名称搜索任务', 'aria-label': '搜索任务' }), m('button.Button', { type: 'button', onclick: () => this.loadReferences() }, '查找任务')]),

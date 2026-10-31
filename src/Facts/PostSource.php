@@ -10,6 +10,28 @@ final class PostSource
 {
     private FieldCatalog $catalog;
     private array $capabilities=[];
+    private array $relations=[];
+    public function registerRelation(string $key,callable $normalize,callable $match,callable $prepare): void
+    {
+        if (isset($this->relations[$key]) || !preg_match('/^[a-z][a-z_]*$/D',$key)) throw new \InvalidArgumentException('Invalid relation');
+        $this->relations[$key]=compact('normalize','match','prepare');
+    }
+    public function normalizeRelations(array $query): array
+    {
+        $result=[];
+        foreach ($query['relations'] ?? [] as $key=>$params) {
+            if (!isset($this->relations[$key])) throw new DomainError('relation_unavailable',202);
+            $result[$key]=($this->relations[$key]['normalize'])($params);
+        }
+        ksort($result); return $result ? ['relations'=>$result] : [];
+    }
+    public function prepareRelations(array $query,int $user,bool $lock): void
+    {
+        foreach ($query['relations'] ?? [] as $key=>$params) {
+            if (!isset($this->relations[$key])) throw new DomainError('relation_unavailable',202);
+            ($this->relations[$key]['prepare'])($user,$lock);
+        }
+    }
     public function __construct(private Db $db, private ?\Closure $visibleIds = null, private ?\Closure $enabled = null, ?FieldCatalog $catalog=null) { $this->catalog=$catalog ?? new FieldCatalog(); }
     public function catalog(): FieldCatalog { return $this->catalog; }
     public function assertAvailable(array $query): void
@@ -109,6 +131,11 @@ final class PostSource
             for($i=0;$i<count($queue);$i++) foreach($children[$queue[$i]] ?? [] as $child) if(!isset($seen[$child])) { $seen[$child]=true; $queue[]=$child; }
             $wanted=array_keys($seen);
         }
+        $relationMatches=[];
+        foreach ($query['relations'] ?? [] as $key=>$params) {
+            if (!isset($this->relations[$key])) throw new DomainError('relation_unavailable',202);
+            $relationMatches[]=($this->relations[$key]['match'])($rows,$params,$lock);
+        }
         $result=[]; $fieldKeys=FieldCatalog::referenced($query);
         foreach ($rows as $row) {
             $id=(int)$row['id']; $state=$states[$id] ?? [];
@@ -117,6 +144,7 @@ final class PostSource
             if(isset($needs['rating'])) $v['rating.count']=(string)($state['rating_count'] ?? 0);
             $valid=isset($visible[$id]) && $row['type']==='comment' && $row['hidden_at']===null && $row['discussion_hidden']===null && !(bool)$row['is_private'] && !(bool)$row['discussion_private'];
             $isFirst=$id===(int)$row['first_post_id'];
+            foreach ($relationMatches as $matches) if (empty($matches[$id])) $valid=false;
             if ($query['post_type']==='topic' && !$isFirst) $valid=false;
             if ($query['post_type']==='reply' && $isFirst) $valid=false;
             if ($wanted) { $in=$tags[$row['discussion_id']] ?? []; if ($board['match']==='any' ? !array_intersect($wanted,$in) : (bool)array_diff($wanted,$in)) $valid=false; }

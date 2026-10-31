@@ -3,7 +3,7 @@ declare(strict_types=1);
 namespace Local\GoodCommunity\Tasks;
 
 use Local\GoodCommunity\Infrastructure\{Actor,Data,Db,DomainError,Outbox};
-use Local\GoodCommunity\Facts\{Compare,DependencyGraph,Evidence,FactEngine,QueryEngine};
+use Local\GoodCommunity\Facts\{DependencyGraph,FactEngine,QueryEngine};
 use Local\GoodCommunity\Currency\Ledger;
 
 final class TaskService
@@ -32,6 +32,7 @@ final class TaskService
     public function save(Actor $actor, array $input, ?string $id=null): array
     {
         $actor->assert('tasks.manage');
+        $this->rejectRemovedFields($input);
         return $this->db->transaction(function () use ($actor,$input,$id) {
             $this->db->one('SELECT id FROM lgc_folders WHERE id=1 FOR UPDATE');
             $old=$id ? $this->find($id) : null;
@@ -63,9 +64,7 @@ final class TaskService
                 $goal=$this->facts->store($input['goal'],$input['atoms'] ?? []); $reward=$this->ledger->rewards($input['reward'] ?? []);
                 if(!$period && !$stop && $this->facts->requiresWindow($goal)) throw new DomainError('period_window_required');
                 $access=$this->access?->normalize($actor,$input['reward_access'] ?? []) ?? [];
-                $this->access?->prepare($access);
-                $max=(int)Data::integer($input['max_claims_per_period'] ?? '1',false,10);
-                if ($max>4294967295) throw new DomainError('invalid_claim_limit');
+                if ($period) $this->facts->assertPeriodic($goal);
                 foreach ($reward as $item) {
                     $resource=$this->ledger->get($item['currency_id']);
                     if ((int)$item['delta']<0) $actor->assert('currency.deduct');
@@ -73,12 +72,10 @@ final class TaskService
                 }
                 $audience=$input['audience'] ?? ['kind'=>'registered'];
                 if (!in_array($audience['kind'] ?? '',['registered','groups'],true) || ($audience['kind']==='groups' && empty($audience['group_ids']))) throw new DomainError('invalid_audience');
-                $policies=$input['policies'] ?? ['completion'=>'retain','reward'=>'retain'];
-                if (!in_array($policies['completion'] ?? '',['retain','invalidate'],true) || !in_array($policies['reward'] ?? '',['retain','reverse'],true)) throw new DomainError('invalid_lifecycle_policy');
                 $version=(int)$this->db->scalar('SELECT COALESCE(MAX(version),0)+1 FROM lgc_task_versions WHERE task_id=?',[$taskId]);
-                $this->db->run("INSERT INTO lgc_task_versions(task_id,version,state,goal,reward,max_claims_per_period,funding_user_id,audience,policies,definition_hash,actor_id,created_at) VALUES(?,?,'draft',?,?,?,?,?,?,?,?,?)",[$taskId,$version,Data::json($goal),Data::json($reward),$max,$actor->id,Data::json($audience),Data::json($policies),Data::hash([$goal,$reward,$max,$actor->id,$audience,$policies]),$actor->id,Data::now()]);
+                $this->db->run("INSERT INTO lgc_task_versions(task_id,version,state,goal,reward,funding_user_id,audience,definition_hash,actor_id,created_at) VALUES(?,?,'draft',?,?,?,?,?,?,?)",[$taskId,$version,Data::json($goal),Data::json($reward),$actor->id,Data::json($audience),Data::hash([$goal,$reward,$actor->id,$audience]),$actor->id,Data::now()]);
                 $this->db->run('UPDATE lgc_tasks SET draft_version=? WHERE id=?',[$version,$taskId]);
-                $this->db->run('UPDATE lgc_task_versions SET reward_access=?,definition_hash=? WHERE task_id=? AND version=?',[Data::json($access),Data::hash([$goal,$reward,$access,$max,$actor->id,$audience,$policies]),$taskId,$version]);
+                $this->db->run('UPDATE lgc_task_versions SET reward_access=?,definition_hash=? WHERE task_id=? AND version=?',[Data::json($access),Data::hash([$goal,$reward,$access,$actor->id,$audience]),$taskId,$version]);
             } elseif (!$old) throw new DomainError('goal_required');
             return ['id'=>$uuid];
         });
@@ -100,10 +97,7 @@ final class TaskService
             }
             $goal=Data::decode($rule['goal']); $atoms=$this->facts->atoms($goal);
             if(!(int)$task['period_seconds'] && !$task['stop_at'] && $this->facts->requiresWindow($goal)) throw new DomainError('period_window_required');
-            if ((int)$rule['max_claims_per_period']!==1) foreach ($goal as $clause) {
-                $progress=false; foreach ($clause as $term) if ($this->facts->consumable($atoms[$term['atom_id']],$term['negated'])!==null) $progress=true;
-                if (!$progress) throw new DomainError('repeat_path_needs_progress');
-            }
+            if ((int)$task['period_seconds']) $this->facts->assertPeriodic($goal);
             $this->graph->validate('task',$id,$goal);
             $now=$this->now();
             if ($task['stop_at'] && $now>=$task['stop_at']) throw new DomainError('task_expired',409);
@@ -113,7 +107,6 @@ final class TaskService
             $this->db->run("UPDATE lgc_tasks SET status='active',latest_version=?,draft_version=NULL,published_at=COALESCE(published_at,?),row_version=row_version+1 WHERE id=?",[$rule['version'],$now,$task['id']]);
             $this->facts->bind('task',(int)$task['id'],(int)$rule['version'],$goal);
             $this->outbox->emit('task.published','task:'.$task['id'],(int)$rule['version'],['task_id'=>(int)$task['id'],'after_user'=>0],$actor->id);
-            $this->schedule($this->find($id),$goal);
             return ['id'=>$id,'effective_from_occurrence'=>(string)$occurrence];
         });
     }
@@ -138,18 +131,18 @@ final class TaskService
         if ($to && $from>=$to) throw new DomainError('invalid_occurrence');
         return ['occurrence'=>$k,'start'=>$from,'end'=>$to];
     }
-    public function period(array $task, ?int $specified=null): array
+    /** Reads do not create a period. Only a successful claim transaction persists it. */
+    public function period(array $task, ?int $specified=null, bool $create=false): array
     {
         $bounds=$this->occurrence($task,$specified);
-        $old=$this->db->one('SELECT * FROM lgc_task_periods WHERE task_id=? AND occurrence=?',[$task['id'],$bounds['occurrence']]);
+        $suffix=$create ? ' LOCK IN SHARE MODE' : '';
+        $old=$this->db->one('SELECT * FROM lgc_task_periods WHERE task_id=? AND occurrence=?'.$suffix,[$task['id'],$bounds['occurrence']]);
         if ($old) return $old;
-        return $this->db->transaction(function () use ($task,$bounds) {
-            $this->db->one('SELECT id FROM lgc_tasks WHERE id=? FOR UPDATE',[$task['id']]);
-            $rule=$this->db->one("SELECT version FROM lgc_task_versions WHERE task_id=? AND state='published' AND effective_from_occurrence<=? ORDER BY effective_from_occurrence DESC,version DESC LIMIT 1",[$task['id'],$bounds['occurrence']]);
-            if (!$rule) throw new DomainError('period_unavailable',409);
-            $this->db->run('INSERT IGNORE INTO lgc_task_periods(task_id,occurrence,version,starts_at,ends_at,created_at) VALUES(?,?,?,?,?,?)',[$task['id'],$bounds['occurrence'],$rule['version'],$bounds['start'],$bounds['end'],Data::now()]);
-            return $this->db->one('SELECT * FROM lgc_task_periods WHERE task_id=? AND occurrence=?',[$task['id'],$bounds['occurrence']]);
-        });
+        $rule=$this->db->one("SELECT version FROM lgc_task_versions WHERE task_id=? AND state='published' AND effective_from_occurrence<=? ORDER BY effective_from_occurrence DESC,version DESC LIMIT 1".$suffix,[$task['id'],$bounds['occurrence']]);
+        if (!$rule) throw new DomainError('period_unavailable',409);
+        if (!$create) return ['id'=>null,'task_id'=>$task['id'],'occurrence'=>$bounds['occurrence'],'version'=>$rule['version'],'starts_at'=>$bounds['start'],'ends_at'=>$bounds['end']];
+        $this->db->run('INSERT IGNORE INTO lgc_task_periods(task_id,occurrence,version,starts_at,ends_at,created_at) VALUES(?,?,?,?,?,?)',[$task['id'],$bounds['occurrence'],$rule['version'],$bounds['start'],$bounds['end'],Data::now()]);
+        return $this->db->one('SELECT * FROM lgc_task_periods WHERE task_id=? AND occurrence=? LOCK IN SHARE MODE',[$task['id'],$bounds['occurrence']]);
     }
     private function rule(array $task, ?array $period=null, bool $draft=false): array
     {
@@ -163,7 +156,7 @@ final class TaskService
         try { if ($task['status']==='active') { $period=$this->period($task); if (!$manage || !$actor->can('tasks.manage')) $rule=$this->rule($task,$period); } } catch (DomainError $e) { if ($e->status!==409) throw $e; }
         if (!$this->visible($actor,$task,$rule)) throw new DomainError('task_not_found',404);
         $goal=Data::decode($rule['goal']);
-        $result=['id'=>$id,'name'=>$task['name'],'comment'=>$task['comment'],'associate_post'=>$task['associate_post_id'],'created_at'=>$task['created_at'],'start_at'=>$task['start_at'],'stop_at'=>$task['stop_at'],'period'=>(int)$task['period_seconds'],'status'=>$task['status'],'version'=>(int)$task['row_version'],'rule_version'=>(int)$rule['version'],'goal'=>$goal,'atoms'=>array_values($this->facts->atoms($goal)),'reward'=>Data::decode($rule['reward']),'max_claims_per_period'=>(string)$rule['max_claims_per_period'],'occurrence'=>$period ? (string)$period['occurrence'] : null,'period_start'=>$period['starts_at'] ?? null,'period_end'=>$period['ends_at'] ?? null,'audience'=>Data::decode($rule['audience']),'policies'=>Data::decode($rule['policies'])];
+        $result=['id'=>$id,'name'=>$task['name'],'comment'=>$task['comment'],'associate_post'=>$task['associate_post_id'],'created_at'=>$task['created_at'],'start_at'=>$task['start_at'],'stop_at'=>$task['stop_at'],'period'=>(int)$task['period_seconds'],'status'=>$task['status'],'version'=>(int)$task['row_version'],'rule_version'=>(int)$rule['version'],'goal'=>$goal,'atoms'=>array_values($this->facts->atoms($goal)),'reward'=>Data::decode($rule['reward']),'occurrence'=>$period ? (string)$period['occurrence'] : null,'period_start'=>$period['starts_at'] ?? null,'period_end'=>$period['ends_at'] ?? null,'audience'=>Data::decode($rule['audience'])];
         $result['reward_access']=Data::decode($rule['reward_access'] ?? null); $result['is_pinned']=(bool)$task['is_pinned'];
         $result['can_pin']=$actor->can('tasks.manage') && ($actor->can('*') || (int)$task['created_by']===$actor->id);
         $result['folder_id']=$task['folder_id'] && (int)$task['folder_id']!==1 ? Data::id($this->db->scalar('SELECT public_id FROM lgc_folders WHERE id=?',[$task['folder_id']])) : null;
@@ -181,30 +174,30 @@ final class TaskService
         $effective="COALESCE((SELECT rv.version FROM lgc_task_versions rv WHERE rv.task_id=t.id AND rv.state='published' AND rv.effective_from_occurrence<=GREATEST(0,COALESCE(FLOOR(TIMESTAMPDIFF(SECOND,t.start_at,UTC_TIMESTAMP())/NULLIF(t.period_seconds,0)),0)) ORDER BY rv.effective_from_occurrence DESC,rv.version DESC LIMIT 1),NULLIF(t.latest_version,0))";
         $version=$actor->can('tasks.manage') && !empty($options['manage']) ? 'COALESCE(t.draft_version,'.$effective.')' : $effective;
         $rows=$this->db->all('SELECT t.*,v.audience,v.reward FROM lgc_tasks t JOIN lgc_task_versions v ON v.task_id=t.id AND v.version='.$version.' LEFT JOIN lgc_folders f ON f.id=t.folder_id WHERE '.$where.' ORDER BY t.id LIMIT '.($limit+1),$args);
+        $claimed=[];
+        if ($actor->id && $rows) {
+            $ids=array_column($rows,'id'); $marks=implode(',',array_fill(0,count($ids),'?'));
+            $claimed=array_column($this->db->all('SELECT c.task_id,c.id,c.active FROM lgc_task_claims c JOIN lgc_task_periods p ON p.id=c.period_id JOIN lgc_tasks t ON t.id=c.task_id WHERE c.user_id=? AND c.task_id IN ('.$marks.') AND p.occurrence=GREATEST(0,COALESCE(FLOOR(TIMESTAMPDIFF(SECOND,t.start_at,?)/NULLIF(t.period_seconds,0)),0))',[$actor->id,...$ids,$this->now()]),null,'task_id');
+        }
         $items=[]; $after=null;
-        foreach (array_slice($rows,0,$limit) as $row) { $after=(string)$row['id']; if (!$this->visible($actor,$row,$row)) continue; $items[]=['id'=>Data::id($row['public_id']),'name'=>$row['name'],'comment'=>$row['comment'],'status'=>$row['status'],'start_at'=>$row['start_at'],'stop_at'=>$row['stop_at'],'period'=>(int)$row['period_seconds'],'is_pinned'=>(bool)$row['is_pinned'],'can_pin'=>$actor->can('*') || (int)$row['created_by']===$actor->id,'version'=>(int)$row['row_version'],'reward'=>Data::decode($row['reward'])]; }
+        foreach (array_slice($rows,0,$limit) as $row) { $after=(string)$row['id']; if (!$this->visible($actor,$row,$row)) continue; $items[]=['id'=>Data::id($row['public_id']),'name'=>$row['name'],'comment'=>$row['comment'],'status'=>$row['status'],'start_at'=>$row['start_at'],'stop_at'=>$row['stop_at'],'period'=>(int)$row['period_seconds'],'is_pinned'=>(bool)$row['is_pinned'],'can_pin'=>$actor->can('*') || (int)$row['created_by']===$actor->id,'version'=>(int)$row['row_version'],'reward'=>Data::decode($row['reward']),'claimed'=>isset($claimed[$row['id']]),'completion_active'=>isset($claimed[$row['id']]) ? (bool)$claimed[$row['id']]['active'] : null]; }
         return ['items'=>$items,'next'=>count($rows)>$limit ? $after : null];
     }
-    public function check(Actor $actor, string $id, bool $background=false): array
+    public function check(Actor $actor, string $id): array
     {
         if (!$actor->id) throw new DomainError('login_required',403);
         $task=$this->find($id); $period=$this->period($task); $rule=$this->rule($task,$period);
         if (!$this->visible($actor,$task,$rule)) throw new DomainError('task_not_found',404);
         if ($task['status']!=='active') throw new DomainError('task_closed',409);
-        $instance=$this->db->one('SELECT * FROM lgc_user_tasks WHERE user_id=? AND period_id=?',[$actor->id,$period['id']]);
-        $count=(int)($instance['claim_count'] ?? 0); $max=(int)$rule['max_claims_per_period'];
-        if ($max && $count>=$max) return ['state'=>'exhausted','claim_count'=>(string)$count,'can_claim'=>false];
+        $claim=$period['id'] ? $this->db->one('SELECT id,active FROM lgc_task_claims WHERE user_id=? AND period_id=?',[$actor->id,$period['id']]) : null;
+        if ($claim) return ['state'=>'claimed','can_claim'=>false,'claim_count'=>'1','claim_id'=>(int)$claim['id'],'active'=>(bool)$claim['active']];
         try {
-            $result=$this->facts->evaluate(Data::decode($rule['goal']),['user'=>$actor->id,'start'=>$period['starts_at'],'end'=>$period['ends_at'],'now'=>$this->now()],(int)$task['id']);
-            $summary=$this->summary($result);
-            $status=$result['truth'] ? 'claimable' : 'pending';
-            if((!$background || $instance || $result['truth']) && (!$instance || $instance['status']!==$status)) $this->db->transaction(function () use ($actor,$task,$period,$result,$count,$status) {
-                $this->db->run("INSERT IGNORE INTO lgc_user_tasks(user_id,period_id,status) VALUES(?,?,'pending')",[$actor->id,$period['id']]);
-                $changed=$this->db->run('UPDATE lgc_user_tasks SET status=? WHERE user_id=? AND period_id=? AND claim_count=? AND status<>?',[$status,$actor->id,$period['id'],$count,$status])->rowCount();
-                if ($changed && $result['truth']) $this->outbox->emit('task.available','ready:'.$task['id'].':'.$actor->id.':'.$period['occurrence'],$count+1,['task_id'=>(int)$task['id'],'occurrence'=>(string)$period['occurrence'],'sequence'=>(string)($count+1)],$actor->id);
-            });
-            return ['state'=>$result['truth'] ? 'claimable' : 'pending','can_claim'=>$result['truth'],'claim_count'=>(string)$count,'use_revision'=>(string)$this->db->source('task-use:'.$task['id'],$actor->id)]+$summary;
-        } catch (DomainError $e) { if ($e->status!==202) throw $e; return ['state'=>'preparing','can_claim'=>false,'claim_count'=>(string)$count,'message'=>$e->getMessage()]; }
+            $result=$this->facts->evaluate(Data::decode($rule['goal']),['user'=>$actor->id,'start'=>$period['starts_at'],'end'=>$period['ends_at'],'now'=>$this->now()]);
+            return ['state'=>$result['truth'] ? 'claimable' : 'pending','can_claim'=>$result['truth'],'claim_count'=>'0']+$this->summary($result);
+        } catch (DomainError $e) {
+            if ($e->status!==202) throw $e;
+            return ['state'=>'preparing','can_claim'=>false,'claim_count'=>'0','message'=>$e->getMessage()];
+        }
     }
     private function summary(array $result): array
     {
@@ -218,68 +211,58 @@ final class TaskService
     private function claimIntent(Actor $actor, string $id, array $input): array
     {
         if (!$actor->id) throw new DomainError('login_required',403);
+        $this->rejectRemovedFields($input);
         $request=strtolower((string)($input['request_id'] ?? '')); Data::bin($request);
         $occurrence=(int)Data::integer($input['occurrence'] ?? null,false,10);
-        $task=$this->find($id);
-        $old=$this->db->one('SELECT c.receipt FROM lgc_task_claims c JOIN lgc_user_tasks u ON u.id=c.user_task_id JOIN lgc_task_periods p ON p.id=u.period_id WHERE c.task_id=? AND c.user_id=? AND p.occurrence=? AND c.request_id=?',[$task['id'],$actor->id,$occurrence,Data::bin($request)]);
-        if ($old) { $receipt=Data::decode($old['receipt']); if ((int)($input['rule_version'] ?? 0)!==(int)$receipt['rule_version']) throw new DomainError('operation_conflict',409); return $receipt; }
-        $period=$this->period($task,$occurrence); $rule=$this->rule($task,$period);
+        $version=(int)($input['rule_version'] ?? 0);
+        if ($old=$this->replayed($actor->id,$request,$id,$occurrence,$version)) return $old;
+        $task=$this->find($id); $period=$this->period($task,$occurrence); $rule=$this->rule($task,$period);
         if (!$this->visible($actor,$task,$rule)) throw new DomainError('task_not_found',404);
-        if ((int)($input['rule_version'] ?? 0)!==(int)$rule['version']) throw new DomainError('rule_version_conflict',409);
-        $context=['user'=>$actor->id,'start'=>$period['starts_at'],'end'=>$period['ends_at'],'now'=>$this->now()];
-        $goal=Data::decode($rule['goal']);
+        if ($version!==(int)$rule['version']) throw new DomainError('rule_version_conflict',409);
         $this->assertOpen($task,$period,$this->now());
-        // Cold scans run here, before acquiring quota or financial locks.
-        $prepared=$this->facts->evaluate($goal,$context,(int)$task['id']);
-        if (!$prepared['truth']) {
-            $queries=$this->facts->postQueries($goal,$prepared['atoms']);
-            if($queries) { $this->queries->invalidateQueries($actor->id,$queries,$context); $prepared=$this->facts->evaluate($goal,$context,(int)$task['id']); }
-            if(!$prepared['truth']) throw new DomainError('not_qualified',409);
-        }
-        $this->db->source('task-use:'.$task['id'],$actor->id);
-        try { return $this->db->transaction(function () use ($actor,$task,$period,$rule,$goal,$request,$occurrence,$input) {
-            $lockedTask=$this->db->one('SELECT * FROM lgc_tasks WHERE id=? LOCK IN SHARE MODE',[$task['id']]);
-            $this->db->one('SELECT id FROM lgc_task_periods WHERE id=? LOCK IN SHARE MODE',[$period['id']]);
-            $this->db->one('SELECT version FROM lgc_source_states WHERE source_key=? AND user_id=? FOR UPDATE',['task-use:'.$task['id'],$actor->id]);
-            $this->db->run("INSERT IGNORE INTO lgc_user_tasks(user_id,period_id,status) VALUES(?,?,'pending')",[$actor->id,$period['id']]);
-            $instance=$this->db->one('SELECT * FROM lgc_user_tasks WHERE user_id=? AND period_id=? FOR UPDATE',[$actor->id,$period['id']]);
-            $old=$this->db->one('SELECT receipt FROM lgc_task_claims WHERE user_task_id=? AND request_id=?',[$instance['id'],Data::bin($request)]);
-            if ($old) { $receipt=Data::decode($old['receipt']); if ((int)($input['rule_version'] ?? 0)!==(int)$receipt['rule_version']) throw new DomainError('operation_conflict',409); return $receipt; }
-            $now=$this->now();
-            $this->assertOpen($lockedTask,$period,$now);
-            if ((int)$rule['max_claims_per_period'] && (int)$instance['claim_count']>=(int)$rule['max_claims_per_period']) throw new DomainError('claim_limit_reached',409);
-            $context=['user'=>$actor->id,'start'=>$period['starts_at'],'end'=>$period['ends_at'],'now'=>$now,'lock'=>true];
-            $result=$this->facts->evaluate($goal,$context,(int)$task['id'],false,true);
+        // A payout never waits for or trusts the display cache. Current bounded
+        // evaluation below can stop as soon as a positive threshold is proved.
+        return $this->db->transaction(function () use ($actor,$task,$request,$occurrence,$version,$id) {
+            $locked=$this->db->one('SELECT * FROM lgc_tasks WHERE id=? LOCK IN SHARE MODE',[$task['id']]);
+            $this->db->sourceLock('task-completions',$actor->id,true);
+            if ($old=$this->replayed($actor->id,$request,$id,$occurrence,$version,true)) return $old;
+            $period=$this->period($locked,$occurrence,true); $rule=$this->rule($locked,$period);
+            if ($version!==(int)$period['version']) throw new DomainError('rule_version_conflict',409);
+            if (!$this->visible($actor,$locked,$rule)) throw new DomainError('task_not_found',404);
+            $this->assertOpen($locked,$period,$this->now());
+            if ($this->db->scalar('SELECT id FROM lgc_task_claims WHERE user_id=? AND period_id=? LOCK IN SHARE MODE',[$actor->id,$period['id']])) throw new DomainError('already_claimed',409);
+            $goal=Data::decode($rule['goal']);
+            $context=['user'=>$actor->id,'start'=>$period['starts_at'],'end'=>$period['ends_at'],'now'=>$this->now(),'lock'=>true];
+            $result=$this->facts->evaluate($goal,$context,null,true,true);
             if (!$result['truth']) throw new DomainError('not_qualified',409);
-            // Both operands of every gate were verified; positive progress uses locked witnesses.
-            $selected=Evidence::choose($result['requirements']);
-            foreach ($result['requirements'] as $requirement) if (count($this->queries->verify($requirement['query'],$context,$selected))<$requirement['required']) throw new DomainError('evidence_changed',409,'帖子条件已变化，请刷新进度');
-            $key=Data::hash(['task',$task['id'],$actor->id,$occurrence,$request]);
-            $money=$this->ledger->taskSettlement($actor->id,(int)$rule['funding_user_id'],Data::decode($rule['reward']),$key,'task:'.$task['id'].':'.$occurrence.':'.$request,'任务《'.$lockedTask['name'].'》第'.((int)$instance['claim_count']+1).'次领取');
+            $access=Data::decode($rule['reward_access'] ?? null);
+            $this->access?->authorize((int)$rule['funding_user_id'],$access,'tasks.manage');
+            $key=Data::hash(['task',$id,$actor->id,$occurrence]);
+            $money=$this->ledger->taskSettlement($actor->id,(int)$rule['funding_user_id'],Data::decode($rule['reward']),$key,'task:'.$id.':'.$actor->id.':'.$occurrence,'任务《'.$locked['name'].'》领取奖励');
             if ($this->afterSettlement) ($this->afterSettlement)();
-            $settledAt=$this->now();
-            $this->assertOpen($lockedTask,$period,$settledAt);
-            $context['now']=$settledAt;
-            $this->facts->verifyTime($goal,(int)$result['clause'],$context);
-            $sequence=(int)$instance['claim_count']+1;
-            $receipt=['task_id'=>Data::id($task['public_id']),'occurrence'=>(string)$occurrence,'sequence'=>(string)$sequence,'request_id'=>$request,'rule_version'=>(int)$rule['version'],'reward'=>Data::decode($rule['reward']),'transaction_id'=>$money['id'],'completed_at'=>$settledAt];
-            $receipt['reward_access']=Data::decode($rule['reward_access'] ?? null);
-            $evidence=['clause'=>$result['clause'],'post_ids'=>$selected,'requirements'=>array_map(fn ($r)=>['required'=>$r['required'],'query'=>$r['query']],$result['requirements']),'gates'=>$this->summary($result),'rule_hash'=>$rule['definition_hash']];
-            $this->db->run('INSERT INTO lgc_task_claims(user_task_id,user_id,task_id,sequence_no,request_id,operation_key,transaction_id,evidence,receipt,claimed_at) VALUES(?,?,?,?,?,?,?,?,?,?)',[$instance['id'],$actor->id,$task['id'],$sequence,Data::bin($request),$key,$money['internal_id'],Data::json($evidence),Data::json($receipt),$settledAt]);
+            $settledAt=$this->now(); $this->assertOpen($locked,$period,$settledAt);
+            $context['now']=$settledAt; $this->facts->verifyTime($goal,(int)$result['clause'],$context);
+            $receipt=['task_id'=>$id,'occurrence'=>(string)$occurrence,'request_id'=>$request,'rule_version'=>$version,'reward'=>Data::decode($rule['reward']),'reward_access'=>$access,'transaction_id'=>$money['id'],'completed_at'=>$settledAt];
+            $evaluation=['rule_hash'=>$rule['definition_hash'],'summary'=>$this->summary($result)];
+            $this->db->run('INSERT INTO lgc_task_claims(task_id,period_id,user_id,request_id,transaction_id,receipt,evaluation,claimed_at) VALUES(?,?,?,?,?,?,?,?)',[$task['id'],$period['id'],$actor->id,Data::bin($request),$money['internal_id'],Data::json($receipt),Data::json($evaluation),$settledAt]);
             $claim=(int)$this->db->pdo->lastInsertId();
-            $this->access?->grant($actor->id,(int)$rule['funding_user_id'],Data::decode($rule['reward_access'] ?? null),'claim:'.$claim);
-            foreach(array_chunk($selected,200) as $batch) {
-                $args=[]; foreach($batch as $object) array_push($args,$task['id'],$actor->id,$object,$claim,$settledAt);
-                $this->db->run("INSERT INTO lgc_task_progress_uses(task_id,user_id,source_key,object_id,claim_id,used_at) VALUES ".implode(',',array_fill(0,count($batch),"(?,?,'posts',?,?,?)")),$args);
-            }
-            $this->db->source('task-use:'.$task['id'],$actor->id,true);
-            $this->db->run("UPDATE lgc_user_tasks SET claim_count=claim_count+1,active_claim_count=active_claim_count+1,last_completed_at=?,status='pending' WHERE id=?",[$settledAt,$instance['id']]);
+            $this->access?->grant($actor->id,(int)$rule['funding_user_id'],$access,'claim:'.$claim,'tasks.manage');
+            $this->db->source('task-completions',$actor->id,true);
             $this->outbox->emit('task.completed','claim:'.$claim,1,['claim_id'=>$claim,'task_id'=>(int)$task['id']],$actor->id);
-            return $receipt;
-        }); } catch(DomainError $error) {
-            if($error->reason==='evidence_changed') $this->queries->invalidateQueries($actor->id,$this->facts->postQueries($goal),$context);
-            throw $error;
-        }
+            return $receipt+['claim_id'=>$claim,'active'=>true];
+        });
+    }
+    private function replayed(int $user,string $request,string $task,int $occurrence,int $version,bool $lock=false): ?array
+    {
+        $old=$this->db->one('SELECT id,receipt,active FROM lgc_task_claims WHERE user_id=? AND request_id=?'.($lock ? ' LOCK IN SHARE MODE' : ''),[$user,Data::bin($request)]);
+        if (!$old) return null;
+        $receipt=Data::decode($old['receipt']);
+        if ($receipt['task_id']!==$task || (int)$receipt['occurrence']!==$occurrence || (int)$receipt['rule_version']!==$version) throw new DomainError('operation_conflict',409);
+        return $receipt+['claim_id'=>(int)$old['id'],'active'=>(bool)$old['active']];
+    }
+    private function rejectRemovedFields(array $input): void
+    {
+        foreach (['max_claims_per_period','policies','sequence_no','sequence','user_task_id','use_revision'] as $field) if (array_key_exists($field,$input)) throw new DomainError('removed_task_field',422,$field.' 已不支持');
     }
     private function assertOpen(array $task, array $period, string $now): void
     {
@@ -293,44 +276,5 @@ final class TaskService
             if((int)$task['row_version']!==$expected) throw new DomainError('version_conflict',409);
             $this->db->run('UPDATE lgc_tasks SET is_pinned=?,row_version=row_version+1 WHERE id=?',[(int)$pinned,$task['id']]); return ['id'=>$uuid,'is_pinned'=>$pinned];
         });
-    }
-    private function schedule(array $task, array $goal): void
-    {
-        $now=$this->now(); $times=[];
-        if ($task['start_at']>$now) $times[]=$task['start_at'];
-        elseif ((int)$task['period_seconds']>0) { try { $times[]=$this->occurrence($task)['end']; } catch (DomainError) {} }
-        if ($next=$this->facts->nextCheck($goal,$now)) $times[]=$next;
-        foreach (array_filter(array_unique($times)) as $time) if (!$task['stop_at'] || $time<$task['stop_at']) $this->outbox->enqueue('task.wake',['task_id'=>(int)$task['id']],'task-wake:'.$task['id'].':'.$time,0,null,$time);
-    }
-    public function wake(int $id): void
-    {
-        $task=$this->db->one('SELECT * FROM lgc_tasks WHERE id=?',[$id]); if (!$task || $task['status']!=='active') return;
-        if ($task['stop_at'] && $this->now()>=$task['stop_at']) { $this->db->run("UPDATE lgc_tasks SET status='closed',row_version=row_version+1 WHERE id=?",[$id]); return; }
-        $rule=$this->rule($task,$this->period($task));
-        $this->outbox->enqueue('tasks.scan',['task_id'=>$id,'after_user'=>0,'trigger'=>Data::uuid()],'task-scan:'.$id.':'.Data::uuid(),1);
-        $this->schedule($task,Data::decode($rule['goal']));
-    }
-    public function affected(Actor $actor, array $dependencies, int $after=0): ?int
-    {
-        if (!$dependencies) return null;
-        $occurrence='IF(t.period_seconds=0,0,GREATEST(0,TIMESTAMPDIFF(SECOND,t.start_at,UTC_TIMESTAMP()) DIV t.period_seconds))';
-        $version="COALESCE((SELECT p.version FROM lgc_task_periods p WHERE p.task_id=t.id AND p.occurrence=$occurrence),(SELECT v.version FROM lgc_task_versions v WHERE v.task_id=t.id AND v.state='published' AND v.effective_from_occurrence<=$occurrence ORDER BY v.effective_from_occurrence DESC,v.version DESC LIMIT 1))";
-        $tasks=$this->db->all("SELECT DISTINCT t.id,t.public_id FROM lgc_bindings b JOIN lgc_tasks t ON t.id=b.owner_id WHERE b.owner_kind='task' AND b.owner_version=$version AND b.dependency_key IN (".implode(',',array_fill(0,count($dependencies),'?')).") AND t.status='active' AND t.id>? AND t.start_at<=UTC_TIMESTAMP() AND (t.stop_at IS NULL OR t.stop_at>UTC_TIMESTAMP()) ORDER BY t.id LIMIT 200",[...$dependencies,$after]);
-        foreach ($tasks as $task) { try { $this->check($actor,Data::id($task['public_id']),true); } catch (DomainError $error) { if (!in_array($error->status,[202,403,404,409],true)) throw $error; } }
-        return count($tasks)===200 ? (int)end($tasks)['id'] : null;
-    }
-    public function candidateAuthors(int $id): bool
-    {
-        $task=$this->db->one('SELECT * FROM lgc_tasks WHERE id=?',[$id]); if (!$task) return false;
-        $period=null; try { $period=$this->period($task); } catch (DomainError $e) { if ($e->status!==409) throw $e; }
-        $goal=Data::decode($this->rule($task,$period)['goal']); $atoms=$this->facts->atoms($goal);
-        foreach ($goal as $clause) { $positive=false; foreach ($clause as $term) if ($this->facts->consumable($atoms[$term['atom_id']],$term['negated'])!==null) $positive=true; if (!$positive) return false; }
-        return true;
-    }
-    public function reconcileUser(Actor $actor, int $after=0): ?int
-    {
-        $rows=$this->db->all("SELECT id,public_id FROM lgc_tasks WHERE status='active' AND id>? ORDER BY id LIMIT 200",[$after]);
-        foreach ($rows as $row) { try { $this->check($actor,Data::id($row['public_id']),true); } catch (DomainError $error) { if (!in_array($error->status,[202,403,404,409],true)) throw $error; } }
-        return count($rows)===200 ? (int)end($rows)['id'] : null;
     }
 }

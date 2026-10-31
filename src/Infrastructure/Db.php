@@ -49,6 +49,17 @@ final class Db
             }
         }
     }
+    /** All writers take an exclusive fence before modifying the corresponding source. */
+    public function sourceLock(string $key, int $user, bool $write=false): int
+    {
+        $suffix=$write ? ' FOR UPDATE' : ' LOCK IN SHARE MODE';
+        $row=$this->one('SELECT version FROM lgc_source_states WHERE source_key=? AND user_id=?'.$suffix,[$key,$user]);
+        if (!$row) {
+            $this->run('INSERT IGNORE INTO lgc_source_states(source_key,user_id,version,updated_at) VALUES(?,?,0,?)',[$key,$user,Data::now()]);
+            $row=$this->one('SELECT version FROM lgc_source_states WHERE source_key=? AND user_id=?'.$suffix,[$key,$user]);
+        }
+        return (int)$row['version'];
+    }
     public function source(string $key, int $user, bool $write = false): int
     {
         $row=$this->one('SELECT version FROM lgc_source_states WHERE source_key=? AND user_id=?',[$key,$user]);

@@ -9,6 +9,7 @@ final class Schema
         $sql = file_get_contents(dirname(__DIR__, 2).'/resources/schema.sql');
         $sql = preg_replace('/^--.*$/m', '', $sql);
         foreach (explode(';', $sql) as $statement) if (trim($statement) !== '') $db->run(trim($statement));
+        foreach (['grantor_group_id','reward_group_id'] as $column) $db->run('ALTER TABLE lgc_reward_group_policies ADD FOREIGN KEY ('.$column.') REFERENCES '.$db->native('groups').'(id) ON DELETE CASCADE');
         $db->run("INSERT INTO lgc_folders(id,public_id,name,name_key,path,depth) VALUES(1,?,'内部根目录','__root__','/1/',0)", [Data::bin(Data::uuid())]);
         $db->run("INSERT INTO lgc_source_states(source_key,user_id,coverage_from,updated_at) VALUES('avatar-coverage',0,?,?)",[Data::now(),Data::now()]);
         foreach (['光玉'=>'currency','经验'=>'experience'] as $name => $kind) {

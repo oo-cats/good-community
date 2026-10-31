@@ -38,12 +38,16 @@ final class Controller implements RequestHandlerInterface
     private function dispatch(Actor $actor, $nativeActor, string $method, string $path, string $id, array $query, array $body): array
     {
         if ($path==='/community/meta') {
-            $groups=$this->db->all('SELECT id,name_singular name FROM '.$this->db->native('groups').' WHERE id NOT IN (SELECT group_id FROM lgc_permission_groups) ORDER BY id'); $tags=[];
+            $groups=$this->db->all('SELECT id,name_singular name FROM '.$this->db->native('groups').' ORDER BY id'); $tags=[];
             if (class_exists(\Flarum\Tags\Tag::class) && $this->db->scalar('SELECT 1 FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name=?',[$this->db->prefix.'tags'])) $tags=\Flarum\Tags\Tag::whereVisibleTo($nativeActor)->get(['id','name','parent_id'])->toArray();
             $keys=['tasks.manage','rating.manage','rating.rate','fields.manage','fields.edit','currency.manage','currency.issue','currency.deduct','currency.transfer','currency.viewHistory','experience.issue','achievements.manage','achievements.grant','achievements.revoke'];
-            return ['methods'=>$this->facts->catalog(),'system_fields'=>array_map(static fn($field)=>$field['type'],$this->queries->systemFields()), 'system_field_definitions'=>$this->queries->systemFields(),'fields'=>$this->fields->list(),'resources'=>$this->ledger->resources($actor,false),'groups'=>$groups,'board_tags'=>$tags,'achievements'=>$this->achievements->list(null,false),'access_rewards'=>resolve(\Local\GoodCommunity\Access\Rewards::class)->catalog($actor),'permissions'=>array_combine($keys,array_map(fn ($key)=>$actor->can($key),$keys))];
+            return ['is_admin'=>$actor->can('*'),'methods'=>$this->facts->catalog(),'system_fields'=>array_map(static fn($field)=>$field['type'],$this->queries->systemFields()), 'system_field_definitions'=>$this->queries->systemFields(),'fields'=>$this->fields->list(),'resources'=>$this->ledger->resources($actor,false),'groups'=>$groups,'board_tags'=>$tags,'achievements'=>$this->achievements->list(null,false),'access_rewards'=>resolve(\Local\GoodCommunity\Access\Rewards::class)->catalog($actor),'permissions'=>array_combine($keys,array_map(fn ($key)=>$actor->can($key),$keys))];
         }
+        if ($path==='/community/reward-group-policies') return resolve(\Local\GoodCommunity\Access\Rewards::class)->policies($actor);
+        if (preg_match('~^/community/reward-group-policies/([0-9]+)/([0-9]+)$~D',$path,$parts)) return resolve(\Local\GoodCommunity\Access\Rewards::class)->setPolicy($actor,(int)$parts[1],(int)$parts[2],$body,$method==='DELETE');
+        if (preg_match('~^/community/task-claims/([0-9]+)/revoke$~D',$path,$parts)) return resolve(\Local\GoodCommunity\Tasks\Completions::class)->revoke($actor,(int)$parts[1],$body);
         if ($path==='/community/tasks') return $method==='GET' ? $this->tasks->list($actor,$query) : $this->tasks->save($actor,$body);
+        if (preg_match('~^/community/tasks/[^/]+/claims$~D',$path)) return resolve(\Local\GoodCommunity\Tasks\Completions::class)->listing($actor,$id,$query);
         if (preg_match('~^/community/tasks/[^/]+/(pin|claim|check|publish|close|copy|stats|rebuild-stats)$~D',$path,$match)) return match ($match[1]) {
             'pin'=>$this->tasks->pin($actor,$id,(bool)($body['is_pinned'] ?? false),(int)($body['expected_version'] ?? 0)),'claim'=>$this->claim($actor,$id,$body),'check'=>['progress'=>$this->tasks->check($actor,$id)],'publish'=>$this->tasks->publish($actor,$id),'close'=>$this->tasks->close($actor,$id),'copy'=>$this->copy($actor,$id,$body),'stats'=>$this->stats->get($actor,$id,$query),'rebuild-stats'=>$this->stats->rebuild($actor,$id),
         };
@@ -86,7 +90,13 @@ final class Controller implements RequestHandlerInterface
             return ['items'=>$this->achievements->list((int)($query['user_id'] ?? $actor->id))];
         }
         if (preg_match('~^/community/achievements/[^/]+/(grant|sources|archive)$~D',$path,$match)) return match ($match[1]) { 'grant'=>$this->achievements->manual($actor,$id,$body),'sources'=>['items'=>$this->achievements->sources($actor,$id,(int)($query['user_id'] ?? 0))],'archive'=>$this->achievements->archive($actor,$id) };
-        if ($path==='/community/query-preview') { $actor->assert('tasks.manage'); $context=['user'=>(int)($body['user_id'] ?? $actor->id),'start'=>Data::date($body['start_at'] ?? null),'end'=>Data::date($body['stop_at'] ?? null)]; $result=$this->queries->read($this->queries->normalize($body['query'] ?? []),$context); unset($result['ids']); return $result; }
+        if ($path==='/community/query-preview') {
+            $actor->assert('tasks.manage'); $query=$this->queries->normalize($body['query'] ?? []);
+            $subject=(int)($body['user_id'] ?? $actor->id);
+            if (!empty($query['relations']) && $subject!==$actor->id) throw new DomainError('private_source_requires_owner',403);
+            $context=['user'=>$subject,'start'=>Data::date($body['start_at'] ?? null),'end'=>Data::date($body['stop_at'] ?? null)];
+            $result=$this->queries->read($query,$context); unset($result['ids']); return $result;
+        }
         if ($path==='/community/work') { $actor->assert('tasks.manage'); return $this->worker->run(20,3); }
         throw new DomainError('route_not_found',404);
     }

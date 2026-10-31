@@ -51,10 +51,6 @@ final class Notifications
     {
         $data=Data::decode($event['payload']); $type=$event['event_type']; $user=(int)$event['subject_user_id'];
         if ($type==='task.published' || ($type==='post.changed' && !empty($data['edited']))) { $this->fanout(['event_id'=>(int)$event['id']]); return; }
-        if ($type==='task.available') {
-            $task=$this->db->one('SELECT public_id FROM lgc_tasks WHERE id=?',[$data['task_id']]); $native=User::find($user);
-            if ($task && $native) { $uuid=Data::id($task['public_id']); try { $progress=$this->tasks->check(Actor::fromUser($native),$uuid,true); if ($progress['can_claim']) $this->deliver((int)$event['id'],$user,'communityTask',['task_id'=>$uuid,'title'=>'任务已达成，可以领取奖励','url'=>'/community/tasks/'.$uuid]); } catch (\Local\GoodCommunity\Infrastructure\DomainError) {} }
-        }
         if ($type==='rating.changed') {
             $post=$this->postContext((int)$data['post_id']); $rater=$this->db->scalar('SELECT username FROM '.$this->db->native('users').' WHERE id=?',[$data['rater_id']]);
             if ($post) {

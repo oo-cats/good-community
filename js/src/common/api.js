@@ -14,6 +14,10 @@ export function uuid() {
 }
 export function errorText(error) {
   const key = error.response?.error;
+  if (key?.startsWith('acgn_')) return 'ACGN 条件暂不能判断，请检查来源是否可用或缩小统计范围。';
+  if (key === 'already_claimed') return '本周期已经领取过，不能再次领取。';
+  if (key === 'reward_group_not_delegated') return '管理员尚未授权你奖励这个用户组。';
+  if (key === 'period_requires_current_window') return '周期任务中的行为统计必须跟随当前周期。';
   if (key === 'custom_profile_source_unavailable') return '自定义个人资料来源暂不可用，请管理员启用支持发布记录接口的资料插件。';
   return ({ period_window_required: '已完成周期数需要有周期或截止时间的任务窗口。', periodic_task_required: '请选择一个周期任务作为统计对象。', period_window_budget: '统计窗口包含的周期过多，请缩小范围。', name_or_identity_conflict: '名称已存在，请换一个名称。', insufficient_balance: '余额不足，尚未扣除任何资源。', content_changed: '帖子正文已更新，请关闭评分窗口，重新阅读后再评分。', permission_denied: '你没有执行此操作的权限。', not_qualified: '条件尚未达成，请刷新进度。', preparing: '正在准备统计，请稍后刷新。', version_conflict: '内容已被更新，请重新加载后编辑。', rule_version_conflict: '任务版本已更新，请重新打开任务。', outside_task_time: '任务已结束或当前不在领取时间内。', evidence_changed: '帖子条件已变化，请刷新进度后重试。', claim_limit_reached: '本周期领取次数已用完。', repeat_path_needs_progress: '可重复任务的每个子式都需要至少一个可累计进度项。', published_schedule_immutable: '发布后不能更改时间安排，请复制为新任务。', once_goal_frozen: '已开始的一次性任务不能更改条件或奖励，请复制为新任务。', dependency_cycle: '前置任务或成就形成循环，请调整条件。', self_funded_reward: '出资人不能从自己的钱包领取任务奖励。' })[key] || '操作未完成，请检查输入或刷新后重试。';
 }

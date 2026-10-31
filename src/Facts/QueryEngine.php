@@ -8,12 +8,30 @@ final class QueryEngine
 {
     public function __construct(private Db $db, private PostSource $source, private Outbox $outbox) {}
     public function normalize(array $query): array {
+        $relations=$this->source->normalizeRelations($query);
         $referenced=$query; if(($query['unfiltered'] ?? false)===true) $referenced['where']=[];
         $query=QuerySpec::normalize($query,$this->source->fields(PostSource::fieldIds($referenced)),$this->source->catalog()->types());
+        $query+=$relations;
         $query['requires_rating']=isset($this->source->catalog()->requirements($query)['rating']);
         $this->source->assertAvailable($query); return $query;
     }
     public function systemFields(): array { return $this->source->catalog()->metadata(); }
+    /** A lower-bound proof, not an exact total. No evidence allocation or persistence. */
+    public function atLeast(array $query,array $context,int $required): array
+    {
+        $query=$this->normalize($query); [$start,$end]=$this->window($query,$context);
+        $this->source->prepareRelations($query,(int)$context['user'],true);
+        $after=0; $count=0; $scanned=0;
+        do {
+            $rows=$this->source->page($context['user'],$start,$end,$after,201,true,null,$query);
+            $more=count($rows)>200; $batch=array_slice($rows,0,200); $scanned+=count($batch);
+            if ($scanned>10000) throw new DomainError('exact_query_budget_exceeded',202);
+            $count+=count(array_filter($this->source->evaluate($batch,$query,true),fn($r)=>$r['truth']));
+            if ($count>=$required) return ['count'=>$count,'lower_bound'=>$more,'query'=>$query];
+            if ($batch) $after=(int)end($batch)['id'];
+        } while ($more);
+        return ['count'=>$count,'lower_bound'=>false,'query'=>$query];
+    }
     public function window(array $query, array $context): array { return $query['time']['mode']==='fixed' ? [$query['time']['start'],$query['time']['end']] : [$context['start'],$context['end']]; }
     public function counter(array $query, array $context): array
     {
@@ -65,19 +83,19 @@ final class QueryEngine
     public function read(array $query, array $context, ?int $task = null): array
     {
         $query=$this->normalize($query);
+        if (!empty($query['relations'])) return $this->exact($query,$context,null,false);
         [$start,$end]=$this->window($query,$context);
         if (!$this->source->hasPosts($context['user'],$start,$end)) return ['count'=>0,'ids'=>[],'counter_id'=>null,'generation'=>0,'source_version'=>0,'query'=>$query];
         $counter=$this->counter($query,$context); $params=[$counter['id']];
-        $exclude='';
-        if ($task!==null) { $exclude=" AND NOT EXISTS(SELECT 1 FROM lgc_task_progress_uses u WHERE u.task_id=? AND u.user_id=? AND u.source_key='posts' AND u.object_id=c.object_id)"; $params[]=$task; $params[]=$context['user']; }
-        $count=$task===null ? (int)$counter['matches'] : (int)$this->db->scalar('SELECT COUNT(*) FROM lgc_counter_contributions c WHERE c.counter_id=?'.$exclude,$params);
-        $ids=array_map('intval',array_column($this->db->all('SELECT c.object_id FROM lgc_counter_contributions c WHERE c.counter_id=?'.$exclude.' ORDER BY c.object_id LIMIT 2000',$params),'object_id'));
+        $count=(int)$counter['matches'];
+        $ids=[];
         return ['count'=>$count,'ids'=>$ids,'counter_id'=>(int)$counter['id'],'generation'=>(int)$counter['generation'],'source_version'=>(int)$counter['source_version'],'query'=>$query];
     }
     /** Full current-state fallback for non-monotone count gates, before any wallet lock. */
     public function exact(array $query, array $context, ?int $task=null, bool $lock=false): array
     {
         $query=$this->normalize($query);
+        $this->source->prepareRelations($query,(int)$context['user'],$lock);
         [$start,$end]=$this->window($query,$context); $after=0; $ids=[]; $scanned=0;
         do {
             $rows=$this->source->page($context['user'],$start,$end,$after,201,$lock,null,$query);
@@ -87,15 +105,7 @@ final class QueryEngine
             foreach ($matches as $id=>$result) if ($result['truth']) $ids[$id]=true;
             if ($batch) $after=(int)end($batch)['id'];
         } while ($more);
-        if ($task!==null && $ids) foreach(array_chunk(array_keys($ids),1000) as $page) foreach ($this->db->all("SELECT object_id FROM lgc_task_progress_uses WHERE task_id=? AND user_id=? AND source_key='posts' AND object_id IN (".implode(',',array_fill(0,count($page),'?')).')',[$task,$context['user'],...$page]) as $used) unset($ids[(int)$used['object_id']]);
         return ['count'=>count($ids),'ids'=>array_keys($ids),'query'=>$query];
-    }
-    public function verify(array $query, array $context, array $ids): array
-    {
-        $query=$this->normalize($query);
-        [$start,$end]=$this->window($query,$context);
-        $rows=$this->source->page($context['user'],$start,$end,0,2000,true,$ids,$query);
-        return array_keys(array_filter($this->source->evaluate($rows,$query,true),fn ($result)=>$result['truth']));
     }
     /** Re-evaluate one object's current state; old payloads never overwrite current values. */
     public function changed(int $user, int $post, ?int $eventVersion=null): void

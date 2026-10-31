@@ -57,7 +57,7 @@ final class Statistics
         $this->db->transaction(function () use ($claimId,$onlyGeneration) {
             $source=$this->db->one('SELECT task_id FROM lgc_task_claims WHERE id=?',[$claimId]); if (!$source) return;
             $task=$this->db->one('SELECT * FROM lgc_tasks WHERE id=? LOCK IN SHARE MODE',[$source['task_id']]);
-            $claim=$this->db->one('SELECT c.*,p.occurrence FROM lgc_task_claims c JOIN lgc_user_tasks u ON u.id=c.user_task_id JOIN lgc_task_periods p ON p.id=u.period_id WHERE c.id=? FOR UPDATE',[$claimId]);
+            $claim=$this->db->one('SELECT c.*,p.occurrence FROM lgc_task_claims c JOIN lgc_task_periods p ON p.id=c.period_id WHERE c.id=? FOR UPDATE',[$claimId]);
             $allowed=array_values(array_unique(array_filter([(int)$task['statistics_generation'],(int)$task['statistics_building_generation']])));
             if($onlyGeneration!==null && !in_array($onlyGeneration,$allowed,true)) return;
             $generations=$onlyGeneration ? [$onlyGeneration] : $allowed;
@@ -65,7 +65,6 @@ final class Statistics
             $snapshots=array_intersect_key($snapshots,array_flip($allowed));
             foreach ($generations as $generation) {
                 $old=$snapshots[$generation] ?? [];
-                $old=$old['task'] ?? $old; // Upgrade the original per-scope snapshot lazily.
                 if ((int)($old['version'] ?? 0)===(int)$claim['validity_version']) continue;
                 $successDelta=$old ? 0 : 1; $activeDelta=(int)$claim['active']-(int)($old['active'] ?? 0);
                 foreach (['task','period:'.$claim['occurrence']] as $scope) {

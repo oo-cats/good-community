@@ -16,7 +16,8 @@
     "flarum-extension": {
       "title": "Good Community",
       "optional-dependencies": [
-        "local/custom-profile"
+        "local/custom-profile",
+        "local/acgn-database"
       ],
       "icon": {
         "color": "#fff",
@@ -30,6 +31,7 @@
   "suggest": {
     "flarum/tags": "Board-tag conditions and event scopes",
     "flarum/likes": "Current post-like conditions",
-    "local/custom-profile": "First successful self-publication condition (PublicationFacts contract)"
+    "local/custom-profile": "First successful self-publication condition (PublicationFacts contract)",
+    "local/acgn-database": "Current collections, first completions and related posts (TaskFactsV1)"
   }
 }

@@ -117,7 +117,7 @@ CREATE TABLE lgc_tasks (
     CONSTRAINT lgc_task_folder FOREIGN KEY (folder_id) REFERENCES lgc_folders(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- T07 Immutable published goal/reward/quota/policies. Several future drafts may share a boundary.
+-- Published rule versions; one receipt per user and period.
 CREATE TABLE lgc_task_versions (
     task_id BIGINT UNSIGNED NOT NULL,
     version INT UNSIGNED NOT NULL,
@@ -126,10 +126,8 @@ CREATE TABLE lgc_task_versions (
     goal JSON NOT NULL,
     reward JSON NOT NULL,
     reward_access JSON NULL,
-    max_claims_per_period INT UNSIGNED NOT NULL DEFAULT 1,
     funding_user_id INT UNSIGNED NOT NULL,
     audience JSON NOT NULL,
-    policies JSON NOT NULL,
     definition_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
     actor_id INT UNSIGNED NOT NULL,
     created_at DATETIME(6) NOT NULL,
@@ -148,65 +146,32 @@ CREATE TABLE lgc_task_periods (
     starts_at DATETIME NOT NULL,
     ends_at DATETIME NULL,
     created_at DATETIME(6) NOT NULL,
-    PRIMARY KEY (id), UNIQUE KEY task_occurrence (task_id,occurrence),
+    PRIMARY KEY (id), UNIQUE KEY task_occurrence (task_id,occurrence), UNIQUE KEY task_period_identity (task_id,id),
     KEY period_end (ends_at,id), KEY period_version (task_id,version),
     CONSTRAINT lgc_period_version FOREIGN KEY (task_id,version) REFERENCES lgc_task_versions(task_id,version)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- T09 Sparse user participation, receipt counts and notification transition state.
-CREATE TABLE lgc_user_tasks (
-    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    user_id INT UNSIGNED NOT NULL,
-    period_id BIGINT UNSIGNED NOT NULL,
-    status VARCHAR(12) CHARACTER SET ascii NOT NULL,
-    claim_count BIGINT UNSIGNED NOT NULL DEFAULT 0,
-    active_claim_count BIGINT UNSIGNED NOT NULL DEFAULT 0,
-    last_completed_at DATETIME(6) NULL,
-    PRIMARY KEY (id), UNIQUE KEY user_period (user_id,period_id),
-    KEY period_participants (period_id,id),
-    CONSTRAINT lgc_user_task_period FOREIGN KEY (period_id) REFERENCES lgc_task_periods(id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- T10 One row per successful intent, not one row per user/period.
--- Receipt/evidence/time are immutable; validity changes append audit events.
+-- Immutable receipts; administrative revocation changes validity only.
 CREATE TABLE lgc_task_claims (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    user_task_id BIGINT UNSIGNED NOT NULL,
-    user_id INT UNSIGNED NOT NULL,
     task_id BIGINT UNSIGNED NOT NULL,
-    sequence_no BIGINT UNSIGNED NOT NULL,
+    period_id BIGINT UNSIGNED NOT NULL,
+    user_id INT UNSIGNED NOT NULL,
     request_id BINARY(16) NOT NULL,
-    operation_key CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
     transaction_id BIGINT UNSIGNED NULL,
-    evidence JSON NOT NULL,
     receipt JSON NOT NULL,
+    evaluation JSON NOT NULL,
     active TINYINT UNSIGNED NOT NULL DEFAULT 1,
     validity_version BIGINT UNSIGNED NOT NULL DEFAULT 1,
     stats_snapshot JSON NULL,
     claimed_at DATETIME(6) NOT NULL,
-    PRIMARY KEY (id), UNIQUE KEY claim_sequence (user_task_id,sequence_no),
-    UNIQUE KEY claim_request (user_task_id,request_id), UNIQUE KEY claim_operation (operation_key),
+    PRIMARY KEY (id), UNIQUE KEY user_period (user_id,period_id),
+    UNIQUE KEY claim_request (user_id,request_id),
+    KEY completed_task_lookup (task_id,user_id,active,id),
+    KEY claimed_task (task_id,id), KEY user_history (user_id,claimed_at,id),
     KEY claim_transaction (transaction_id),
-    KEY completed_task_lookup (user_id,task_id,active,claimed_at,id),
-    KEY completed_claim_history (user_id,task_id,id),
-    KEY claimed_task (task_id),
-    CONSTRAINT lgc_claim_instance FOREIGN KEY (user_task_id) REFERENCES lgc_user_tasks(id),
-    CONSTRAINT lgc_claim_task FOREIGN KEY (task_id) REFERENCES lgc_tasks(id),
+    CONSTRAINT lgc_claim_period FOREIGN KEY (task_id,period_id) REFERENCES lgc_task_periods(task_id,id),
     CONSTRAINT lgc_claim_transaction FOREIGN KEY (transaction_id) REFERENCES lgc_transactions(id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- T32 Indexed evidence use, scoped to a user and task across all periods/rounds.
-CREATE TABLE lgc_task_progress_uses (
-    task_id BIGINT UNSIGNED NOT NULL,
-    user_id INT UNSIGNED NOT NULL,
-    source_key VARCHAR(100) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-    object_id BIGINT UNSIGNED NOT NULL,
-    claim_id BIGINT UNSIGNED NOT NULL,
-    used_at DATETIME(6) NOT NULL,
-    PRIMARY KEY (task_id,user_id,source_key,object_id),
-    KEY claim_progress_uses (claim_id), KEY object_uses (source_key,object_id,task_id,user_id),
-    CONSTRAINT lgc_progress_use_task FOREIGN KEY (task_id) REFERENCES lgc_tasks(id),
-    CONSTRAINT lgc_progress_use_claim FOREIGN KEY (claim_id) REFERENCES lgc_task_claims(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- T33 Sparse display-statistics projection members, rebuilt independently from money.
@@ -562,25 +527,30 @@ CREATE TABLE lgc_notification_deliveries (
     CONSTRAINT lgc_delivery_event FOREIGN KEY (event_id) REFERENCES lgc_events(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE lgc_permission_groups (
-    permission VARCHAR(150) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-    group_id INT UNSIGNED NOT NULL,
-    PRIMARY KEY (permission), UNIQUE KEY permission_group (group_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE TABLE lgc_access_sources (
     user_id INT UNSIGNED NOT NULL,
     source_key VARCHAR(160) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-    kind VARCHAR(12) CHARACTER SET ascii NOT NULL,
-    target_key VARCHAR(150) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    group_id INT UNSIGNED NOT NULL,
     issuer_id INT UNSIGNED NOT NULL,
     active TINYINT UNSIGNED NOT NULL DEFAULT 1,
     granted_at DATETIME(6) NOT NULL,
     revoked_at DATETIME(6) NULL,
-    PRIMARY KEY (user_id,source_key,kind,target_key), KEY access_active (user_id,kind,active,target_key)
+    PRIMARY KEY (user_id,source_key,group_id), KEY access_active (user_id,group_id,active)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE TABLE lgc_access_memberships (
     user_id INT UNSIGNED NOT NULL,
     group_id INT UNSIGNED NOT NULL,
     preexisting TINYINT UNSIGNED NOT NULL,
     PRIMARY KEY (user_id,group_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE lgc_reward_group_policies (
+    grantor_group_id INT UNSIGNED NOT NULL,
+    reward_group_id INT UNSIGNED NOT NULL,
+    created_by INT UNSIGNED NOT NULL,
+    created_at DATETIME(6) NOT NULL,
+    updated_at DATETIME(6) NOT NULL,
+    row_version INT UNSIGNED NOT NULL DEFAULT 1,
+    PRIMARY KEY (grantor_group_id,reward_group_id),
+    KEY reward_grantors (reward_group_id,grantor_group_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

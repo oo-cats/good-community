@@ -23,7 +23,6 @@ final class Achievements
             $goal=$mode==='automatic' ? $this->facts->store($input['goal'] ?? [],$input['atoms'] ?? []) : null;
             if($goal && $this->facts->requiresWindow($goal)) throw new DomainError('period_window_required');
             $access=$this->access?->normalize($actor,$input['reward_access'] ?? []) ?? [];
-            $this->access?->prepare($access);
             if ($goal) $this->graph->validate('achievement',$uuid,$goal);
             if ($old) { $id=(int)$old['id']; $version=(int)$old['latest_version']+1; $this->db->run('UPDATE lgc_achievements SET name=?,name_key=?,description=?,latest_version=?,row_version=row_version+1 WHERE id=?',[$name,Data::nameKey($name),$description,$version,$id]); }
             else { $this->db->run("INSERT INTO lgc_achievements(public_id,name,name_key,description,status,latest_version,created_at) VALUES(?,?,?,?,'active',1,?)",[Data::bin($uuid),$name,Data::nameKey($name),$description,Data::now()]); $id=(int)$this->db->pdo->lastInsertId(); $version=1; }

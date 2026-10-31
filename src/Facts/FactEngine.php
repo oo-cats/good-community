@@ -52,13 +52,15 @@ final class FactEngine
             return (bool)$this->db->scalar($sql.' LIMIT 1'.(!empty($context['lock']) ? ' LOCK IN SHARE MODE' : ''),$args);
         });
         $this->register('date.now.v1',['title'=>'当前日期','type'=>'instant'],fn ($params)=>[],static function ($params,$context) { $date=new \DateTimeImmutable($context['now'],new \DateTimeZone('UTC')); return (string)((int)$date->format('U')*1000+(int)$date->format('v')); });
-        $this->register('wallet.balance.v1',['title'=>'持有资源数量','type'=>'integer'],fn ($p)=>$this->reference($p,'currency_id','lgc_currencies'),fn ($p,$c)=>(string)($this->db->scalar('SELECT w.balance FROM lgc_wallets w JOIN lgc_currencies r ON r.id=w.currency_id WHERE w.user_id=? AND r.public_id=?'.(!empty($c['lock']) ? ' LOCK IN SHARE MODE' : ''),[$c['user'],Data::bin($p['currency_id'])]) ?: '0'));
+        $this->register('wallet.balance.v1',['title'=>'货币余额或经验值','type'=>'integer','help'=>'选择一种货币或经验，判断用户当前的数值，例如光玉余额至少100，或经验值至少30。'],fn ($p)=>$this->reference($p,'currency_id','lgc_currencies'),fn ($p,$c)=>(string)($this->db->scalar('SELECT w.balance FROM lgc_wallets w JOIN lgc_currencies r ON r.id=w.currency_id WHERE w.user_id=? AND r.public_id=?'.(!empty($c['lock']) ? ' LOCK IN SHARE MODE' : ''),[$c['user'],Data::bin($p['currency_id'])]) ?: '0'));
     }
+    private array $sourceGuards=[];
+    public function sourceGuard(string $dependency,callable $guard): void { $this->sourceGuards[$dependency]=$guard; ksort($this->sourceGuards); }
     public function register(string $method, array $schema, callable $validate, callable $read, array $hooks=[]): void
     {
         if (isset($this->providers[$method]) || !preg_match('/^[a-z][a-z0-9_.]+\.v[0-9]+$/D',$method)) throw new \InvalidArgumentException('Invalid or duplicate fact method');
         if(!in_array($schema['type'] ?? '',['integer','decimal','boolean','string','instant','duration'],true)) throw new \InvalidArgumentException('Invalid fact value type');
-        foreach($hooks as $key=>$hook) if(!in_array($key,['dependencies','references','nextWake'],true) || !is_callable($hook)) throw new \InvalidArgumentException('Invalid fact hook');
+        foreach($hooks as $key=>$hook) if(!in_array($key,['dependencies','references','assertPeriodic'],true) || !is_callable($hook)) throw new \InvalidArgumentException('Invalid fact hook');
         $this->providers[$method]=['schema'=>$schema,'validate'=>$validate,'read'=>$read,'hooks'=>$hooks];
     }
     public function catalog(): array
@@ -150,6 +152,19 @@ final class FactEngine
         if (count($result)!==count($ids)) throw new DomainError('atom_unavailable',202);
         return $result;
     }
+    /** Check every operand and every branch, including paths not reached by short circuit. */
+    public function assertPeriodic(array $goal): void
+    {
+        foreach ($this->atoms($goal) as $atom) {
+            $specs=$atom['atom_method']==='compare.v1' ? [$atom['params']['left'],$atom['params']['right']] : [['method'=>$atom['atom_method'],'params'=>$atom['params']]];
+            foreach ($specs as $spec) {
+                $method=$spec['method'] ?? '';
+                if ($method==='query.posts.count.v1' && ($spec['params']['query']['time']['mode'] ?? 'inherit')!=='inherit') throw new DomainError('period_requires_current_window',422);
+                if ($check=$this->providers[$method]['hooks']['assertPeriodic'] ?? null) $check($spec['params'] ?? []);
+                if (($this->providers[$method]['schema']['temporal'] ?? '')==='action' && ($spec['params']['time']['mode'] ?? 'inherit')!=='inherit') throw new DomainError('period_requires_current_window',422);
+            }
+        }
+    }
     public function requiresWindow(array $goal): bool
     {
         foreach($this->atoms($goal) as $atom) {
@@ -158,27 +173,15 @@ final class FactEngine
         }
         return false;
     }
-    public function consumable(array $atom, bool $negated=false): ?int
+    private function lowerBound(array $atom, bool $negated=false): ?int
     {
         $p=$atom['params'];
         if ($negated || $atom['atom_method']!=='compare.v1' || ($p['left']['method'] ?? '')!=='query.posts.count.v1' || !in_array($p['operator'],['>=','>'],true)) return null;
         $target=$p['right']['literal'] ?? null;
         if ((!is_string($target) && !is_int($target)) || !preg_match('/^[0-9]{1,4}$/D',(string)$target)) return null;
         $required=(int)$target+($p['operator']==='>' ? 1 : 0);
-        if ($required>1000) throw new DomainError('single_round_evidence_budget');
+        if ($required>1000) return null; // Larger thresholds use the bounded exact path.
         return $required>0 ? $required : null;
-    }
-    public function postQueries(array $goal,?array $evaluated=null): array
-    {
-        $queries=[];
-        foreach($this->atoms($goal) as $id=>$atom) {
-            if($evaluated!==null && !isset($evaluated[$id])) continue;
-            if($atom['atom_method']!=='compare.v1') continue;
-            foreach([$atom['params']['left'],$atom['params']['right']] as $spec) if(($spec['method'] ?? '')==='query.posts.count.v1') {
-                $query=$spec['params']['query']; $queries[Data::hash($query)]=$query;
-            }
-        }
-        return array_values($queries);
     }
     private function readValue(array $spec, array $context, ?int $task, array &$cache, bool $exact): mixed
     {
@@ -194,19 +197,25 @@ final class FactEngine
     public function evaluate(array $goal, array $context, ?int $task=null, bool $exact=false, bool $claim=false): array
     {
         $atoms=$this->atoms($goal); $cache=[]; $results=[]; $clauses=[]; $errors=[]; $pending=null;
+        // Acquire source fences before any branch takes entity locks. Availability is
+        // still evaluated per atom, so an unavailable OR branch cannot block another.
+        if (!empty($context['lock']) && $this->sourceGuards) {
+            $dependencies=$this->dependencies($goal);
+            foreach ($this->sourceGuards as $key=>$guard) if (in_array($key,$dependencies,true)) $guard($context);
+        }
         foreach ($goal as $index=>$clause) {
-            $truth=true; $requirements=[]; $unknown=null;
+            $truth=true; $unknown=null;
             foreach ($clause as $term) {
-                $id=$term['atom_id']; $atom=$atoms[$id]; $required=$this->consumable($atom,$term['negated']);
+                $id=$term['atom_id']; $atom=$atoms[$id]; $required=$claim ? $this->lowerBound($atom,$term['negated']) : null;
                 // Polarity changes the proof required for a repeated atom.
-                $verified=$exact || ($claim && $required===null);
+                $verified=$exact || $claim;
                 $resultKey=$id.':'.(int)$verified;
                 try {
                 if(isset($errors[$resultKey])) throw $errors[$resultKey];
                 if (!isset($cache['atom:'.$resultKey])) {
                     $p=$atom['params'];
                     if ($atom['atom_method']==='compare.v1') {
-                        $left=$this->readValue($p['left'],$context,$task,$cache,$verified); $right=$this->readValue($p['right'],$context,null,$cache,$verified);
+                        $left=$required!==null ? $this->queries->atLeast($p['left']['params']['query'],$context,$required) : $this->readValue($p['left'],$context,null,$cache,$verified); $right=$this->readValue($p['right'],$context,null,$cache,$verified);
                         $count=is_array($left) && isset($left['count']); $value=$count ? (string)$left['count'] : $left;
                         if (is_array($right) && isset($right['count'])) $right=(string)$right['count'];
                         $type=$this->valueType($p['left']) ?? $this->valueType($p['right']) ?? (is_int($value) ? 'integer' : 'string');
@@ -223,14 +232,13 @@ final class FactEngine
                 }
                 $literal=$term['negated'] ? !$result['truth'] : $result['truth'];
                 if (!$literal) { $truth=false; break; }
-                if ($required!==null) $requirements[$id]=['required'=>$required,'ids'=>$result['query']['ids'],'query'=>$result['query']['query']];
             }
             $clauses[]=['index'=>$index,'truth'=>$truth && $unknown ? null : $truth];
-            if ($truth && !$unknown) return ['truth'=>true,'clause'=>$index,'requirements'=>$requirements,'atoms'=>$results,'clauses'=>$clauses];
+            if ($truth && !$unknown) return ['truth'=>true,'clause'=>$index,'atoms'=>$results,'clauses'=>$clauses];
             if($truth) $pending ??= $unknown;
         }
         if($pending) throw $pending;
-        return ['truth'=>false,'clause'=>null,'requirements'=>[],'atoms'=>$results,'clauses'=>$clauses];
+        return ['truth'=>false,'clause'=>null,'atoms'=>$results,'clauses'=>$clauses];
     }
     public function references(array $goal,?array $definitions=null): array
     {
@@ -256,6 +264,7 @@ final class FactEngine
                 $method=$spec['method'] ?? '';
                 if ($method==='query.posts.count.v1') {
                     $keys[]='source:posts'; $query=$spec['params']['query'];
+                    if (!empty($query['relations']['acgn'])) $keys[]='source:acgn';
                     if ($query['requires_rating']) $keys[]='source:rating';
                     foreach ($query['where'] as $clause) foreach ($clause as $term) foreach ([$term['left']['field'],$term['right']['field'] ?? ''] as $field) {
                         if ($field==='likes.count') $keys[]='source:likes';
@@ -278,24 +287,6 @@ final class FactEngine
             $args=[]; foreach($batch as $dependency) array_push($args,$kind,$id,$version,$dependency);
             $this->db->run('INSERT IGNORE INTO lgc_bindings(owner_kind,owner_id,owner_version,dependency_key) VALUES '.implode(',',array_fill(0,count($batch),'(?,?,?,?)')),$args);
         }
-    }
-    public function nextCheck(array $goal, string $now): ?string
-    {
-        $next=null;
-        foreach ($this->atoms($goal) as $atom) {
-            $specs=$atom['atom_method']==='compare.v1' ? [$atom['params']['left'],$atom['params']['right']] : [['method'=>$atom['atom_method'],'params'=>$atom['params']]];
-            foreach($specs as $spec) if($hook=$this->providers[$spec['method'] ?? '']['hooks']['nextWake'] ?? null) {
-                $target=$hook($spec['params'] ?? [],$now);
-                if($target!==null && $target>$now && ($next===null || $target<$next)) $next=$target;
-            }
-            if ($atom['atom_method']!=='compare.v1') continue; $p=$atom['params'];
-            foreach ([[$p['left'],$p['right']],[$p['right'],$p['left']]] as [$date,$other]) {
-                if (($date['method'] ?? '')!=='date.now.v1' || !isset($other['literal']) || !preg_match('/^[0-9]{1,15}$/D',(string)$other['literal'])) continue;
-                $milliseconds=(int)$other['literal']+1; $target=gmdate('Y-m-d H:i:s',intdiv($milliseconds,1000)).'.'.str_pad((string)($milliseconds%1000),3,'0',STR_PAD_LEFT).'000';
-                if ($target>$now && ($next===null || $target<$next)) $next=$target;
-            }
-        }
-        return $next;
     }
     public function verifyTime(array $goal, int $clause, array $context): void
     {

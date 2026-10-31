@@ -5,14 +5,14 @@ import GoalEditor, { newGoal, input, select, label, checks } from './GoalEditor'
 import UserPicker from './UserPicker';
 import { api, uuid, errorText, localDate, utcDate, rewardText, resourceIcon } from './api';
 
-const titles = { tasks: '任务', rating: '评分', resources: '货币', achievements: '成就' };
+const titles = { tasks: '任务', rating: '评分', resources: '货币', achievements: '成就', delegation: '奖励组授权' };
 const statuses = { active: '进行中', draft: '草稿', closed: '已关闭' };
 function button(text, click, primary = false, disabled = false) { return m('button.Button' + (primary ? '.Button--primary' : ''), { type: 'button', onclick: click, disabled }, text); }
 
 export default class AdminPanel extends Component {
   oninit(vnode) { super.oninit(vnode); this.tab = 'tasks'; this.rows = []; this.error = ''; this.loading = true; this.busy = false; this.search = ''; this.load(); }
   async load() {
-    try { this.meta = await api(this.attrs.app, '/meta'); this.tabs = Object.keys(titles).filter(key => ({ tasks: this.meta.permissions['tasks.manage'], rating: this.meta.permissions['rating.manage'] || this.meta.permissions['fields.manage'], resources: ['currency.manage', 'currency.issue', 'currency.deduct', 'experience.issue'].some(key => this.meta.permissions[key]), achievements: this.meta.permissions['achievements.manage'] || this.meta.permissions['achievements.grant'] || this.meta.permissions['achievements.revoke'] })[key]); if (!this.tabs.includes(this.tab)) this.tab = this.tabs[0]; await this.list(); }
+    try { this.meta = await api(this.attrs.app, '/meta'); this.tabs = Object.keys(titles).filter(key => ({ delegation: this.meta.is_admin, tasks: this.meta.permissions['tasks.manage'], rating: this.meta.permissions['rating.manage'] || this.meta.permissions['fields.manage'], resources: ['currency.manage', 'currency.issue', 'currency.deduct', 'experience.issue'].some(key => this.meta.permissions[key]), achievements: this.meta.permissions['achievements.manage'] || this.meta.permissions['achievements.grant'] || this.meta.permissions['achievements.revoke'] })[key]); if (!this.tabs.includes(this.tab)) this.tab = this.tabs[0]; await this.list(); }
     catch (error) { this.error = errorText(error); } finally { this.loading = false; m.redraw(); }
   }
   async list(after = null) {
@@ -21,6 +21,7 @@ export default class AdminPanel extends Component {
       const [result, folders] = await Promise.all([api(app, '/tasks', 'GET', { manage: 1, limit: 20, ...(after ? { after } : {}), ...(this.search ? { search: this.search } : {}), ...(this.folder ? { folder_id: this.folder } : {}) }), api(app, '/folders')]);
       this.rows = after ? [...this.rows, ...result.items] : result.items; this.next = result.next; this.folders = folders.items;
     }
+    if (this.tab === 'delegation') this.rows = (await api(app, '/reward-group-policies')).items;
     if (this.tab === 'resources') this.rows = (await api(app, '/resources')).items;
     if (this.tab === 'rating') { this.policies = this.meta.permissions['rating.manage'] ? (await api(app, '/rating-policies')).items : []; this.rows = (await api(app, '/fields')).items; }
     if (this.tab === 'achievements') this.rows = this.meta.permissions['achievements.manage'] ? (await api(app, '/achievements', 'GET', { manage: 1 })).items : this.meta.achievements || [];
@@ -33,7 +34,7 @@ export default class AdminPanel extends Component {
     finally { this.busy = false; m.redraw(); }
   }
   async openTask(id) { await this.act(async () => { const task = await api(this.attrs.app, `/tasks/${id}`, 'GET', { manage: 1 }); this.edit = { ...task, expected_version: task.version }; }, false); }
-  newTask() { this.edit = { name: '', comment: '', start_at: new Date().toISOString(), stop_at: null, period: 0, max_claims_per_period: '1', reward: [], policies: { completion: 'retain', reward: 'retain' }, audience: { kind: 'registered' }, ...newGoal() }; }
+  newTask() { this.edit = { name: '', comment: '', start_at: new Date().toISOString(), stop_at: null, period: 0, reward: [], audience: { kind: 'registered' }, ...newGoal() }; }
   async saveTask(publish = false) {
     await this.act(async () => {
       const draft = this.edit; const data = { ...draft, expected_version: draft.version, period: Number(draft.period) };
@@ -50,15 +51,32 @@ export default class AdminPanel extends Component {
     return m('.Community-panel', [
       m('nav.Community-tabs', { 'aria-label': '管理面板' }, (this.tabs || []).map(key => button(titles[key], () => { this.tab = key; this.edit = null; this.error = ''; this.list().catch(error => { this.error = errorText(error); m.redraw(); }); }, this.tab === key))),
       this.error && m('.Community-error', { role: 'alert' }, this.error), this.notice && m('.Community-success', { role: 'status' }, this.notice),
-      !this.tab ? m('.Community-empty', '你目前没有管理权限。') : this.tab === 'tasks' ? this.taskView() : this.tab === 'resources' ? this.resourceView() : this.tab === 'rating' ? this.ratingView() : this.achievementView(),
+      !this.tab ? m('.Community-empty', '你目前没有管理权限。') : this.tab === 'tasks' ? this.taskView() : this.tab === 'resources' ? this.resourceView() : this.tab === 'rating' ? this.ratingView() : this.tab === 'delegation' ? this.delegationView() : this.achievementView(),
     ]);
+  }
+  delegationView() {
+    const app = this.attrs.app; const groups = this.meta.groups || [];
+    return [m('h2', '奖励用户组授权'), m('p.helpText', '指定哪些管理者用户组可以奖励哪些组。普通管理者还须属于目标组；管理员也需要配置授权。'),
+      m('.Community-row', [label('管理者用户组', select(this.grantor || '', [['', '选择管理者组'], ...groups.filter(g => Number(g.id) !== 2 && Number(g.id) !== 3).map(g => [String(g.id), g.name])], value => this.grantor = value, '管理者用户组')), label('可奖励的用户组', select(this.rewardGroup || '', [['', '选择奖励组'], ...groups.filter(g => Number(g.id) > 3).map(g => [String(g.id), g.name])], value => this.rewardGroup = value, '可奖励的用户组')), button('添加授权', () => this.act(() => api(app, `/reward-group-policies/${this.grantor}/${this.rewardGroup}`, 'PUT', { expected_version: 0 })), true, !this.grantor || !this.rewardGroup)]),
+      this.rows.map(row => m('article.Community-listRow', [m('.Community-grow', `${row.grantor_name} → ${row.reward_name}`), button('撤回授权', () => this.act(() => api(app, `/reward-group-policies/${row.grantor_group_id}/${row.reward_group_id}`, 'DELETE', { expected_version: row.row_version })))])), m('p.helpText', '撤回只阻止以后新增授予；已经发出的用户组不在此处收回。管理员权限组不能作为奖励。')];
   }
   taskView() {
     if (this.edit) return this.taskEditor();
+    if (this.receiptTask) return this.receiptView();
     return [m('.Community-toolbar', [m('h2', '任务列表'), button('新建任务', () => this.newTask(), true)]),
       m('.Community-row', [input(this.search, value => this.search = value, { placeholder: '按名称搜索', 'aria-label': '搜索任务', onkeydown: event => { if (event.key === 'Enter') this.list(); } }), select(this.folder || '', [['', '全部目录'], ...(this.folders || []).map(item => [item.id, `${'　'.repeat(Math.max(0, item.depth - 1))}${item.name}`])], value => { this.folder = value; this.list(); }, '任务目录'), button('搜索', () => this.list()), button('管理目录', () => this.folderForm = !this.folderForm)]),
       this.folderForm && m('section.Community-card', [m('h3', '任务目录'), label('名称', input(this.folderName || '', value => this.folderName = value)), label('上级目录', select(this.folderParent || '', [['', '根目录'], ...(this.folders || []).map(item => [item.id, item.name])], value => this.folderParent = value, '上级目录')), button('创建目录', () => this.act(async () => { await api(this.attrs.app, '/folders', 'POST', { name: this.folderName, parent_id: this.folderParent || null }); this.folderName = ''; })), (this.folders || []).map(folder => m('.Community-row', [m('span', `${'　'.repeat(Math.max(0, folder.depth - 1))}${folder.name}`), button('重命名／移动', () => { this.folderEdit = { ...folder }; this.folderName = folder.name; this.folderParent = folder.parent_id || ''; }), button('删除空目录', () => this.act(() => api(this.attrs.app, `/folders/${folder.id}`, 'DELETE')))])), this.folderEdit && button('保存目录修改', () => this.act(async () => { await api(this.attrs.app, '/folders', 'POST', { ...this.folderEdit, name: this.folderName, parent_id: this.folderParent || null, expected_version: this.folderEdit.version }); this.folderEdit = null; }))]),
-      this.rows.length ? m('.Community-list', this.rows.map(task => m('article.Community-listRow', [m('.Community-grow', [m('h3', task.name), m('p.helpText', task.comment)]), m('span.Community-status', statuses[task.status]), task.can_pin && button(task.is_pinned ? '取消首页置顶' : '首页置顶', () => this.act(() => api(this.attrs.app, `/tasks/${task.id}/pin`, 'POST', { is_pinned: !task.is_pinned, expected_version: task.version }))), button('编辑', () => this.openTask(task.id)), task.status !== 'closed' && button(task.status === 'draft' ? '删除草稿' : '关闭', () => this.act(() => api(this.attrs.app, `/tasks/${task.id}${task.status === 'draft' ? '' : '/close'}`, task.status === 'draft' ? 'DELETE' : 'POST'))), button('复制', () => this.act(() => api(this.attrs.app, `/tasks/${task.id}/copy`, 'POST', { name: `${task.name} 副本 ${new Date().toLocaleDateString()}` })))]))) : m('.Community-empty', '暂无任务。新建一个任务开始配置。'), this.next && button('加载更多', () => this.list(this.next))];
+      this.rows.length ? m('.Community-list', this.rows.map(task => m('article.Community-listRow', [m('.Community-grow', [m('h3', task.name), m('p.helpText', task.comment)]), m('span.Community-status', statuses[task.status]), task.can_pin && button(task.is_pinned ? '取消首页置顶' : '首页置顶', () => this.act(() => api(this.attrs.app, `/tasks/${task.id}/pin`, 'POST', { is_pinned: !task.is_pinned, expected_version: task.version }))), button('编辑', () => this.openTask(task.id)), this.meta.is_admin && button('完成记录', () => { this.receiptTask = task; this.loadReceipts(); }), task.status !== 'closed' && button(task.status === 'draft' ? '删除草稿' : '关闭', () => this.act(() => api(this.attrs.app, `/tasks/${task.id}${task.status === 'draft' ? '' : '/close'}`, task.status === 'draft' ? 'DELETE' : 'POST'))), button('复制', () => this.act(() => api(this.attrs.app, `/tasks/${task.id}/copy`, 'POST', { name: `${task.name} 副本 ${new Date().toLocaleDateString()}` })))]))) : m('.Community-empty', '暂无任务。新建一个任务开始配置。'), this.next && button('加载更多', () => this.list(this.next))];
+  }
+  async loadReceipts(after = null) {
+    await this.act(async () => { const result = await api(this.attrs.app, '/tasks/' + this.receiptTask.id + '/claims', 'GET', after ? { after } : {}); this.receipts = after ? [...this.receipts, ...result.items] : result.items; this.receiptNext = result.next; }, false);
+  }
+  receiptView() {
+    return [m('.Community-toolbar', [button('← 返回任务列表', () => this.receiptTask = null), m('h2', this.receiptTask.name + ' · 完成记录')]),
+      m('p.helpText', '撤销会扣减有效完成次数，但不会退回资源、收回任务奖励组或恢复本周期领取次数。'),
+      m('table.Community-table', [m('thead', m('tr', ['用户', '周期', '领取时间', '状态', '操作'].map(text => m('th', text)))), m('tbody', (this.receipts || []).map(row => m('tr', [m('td', row.username || '用户 #' + row.user_id), m('td', Number(row.occurrence) + 1), m('td', new Date(row.claimed_at.replace(' ', 'T') + 'Z').toLocaleString()), m('td', Number(row.active) ? '有效' : '已撤销'), m('td', Number(row.active) ? button('撤销完成', () => { this.revokeRow = row; this.revokeReason = ''; this.revokeIntent = uuid(); }) : '—')])))]),
+      this.receiptNext && button('加载更多', () => this.loadReceipts(this.receiptNext)),
+      this.revokeRow && m('section.Community-card', [m('h3', '撤销 ' + this.revokeRow.username + ' 的完成记录'), label('撤销原因', input(this.revokeReason, value => this.revokeReason = value, { maxlength: 500 })), button('确认撤销', () => this.act(async () => { await api(this.attrs.app, '/task-claims/' + this.revokeRow.id + '/revoke', 'POST', { request_id: this.revokeIntent, reason: this.revokeReason }); this.revokeRow.active = 0; this.revokeRow = null; }, false), true, !this.revokeReason.trim() || this.busy), button('取消', () => this.revokeRow = null)])];
   }
   taskEditor() {
     const task = this.edit; const frozen = task.id && task.status !== 'draft' && !Number(task.period) && new Date(task.start_at.replace(' ', 'T') + (/Z$/.test(task.start_at) ? '' : 'Z')) <= new Date();
@@ -72,8 +90,8 @@ export default class AdminPanel extends Component {
         m(AccessRewardEditor, { model: task, meta: this.meta }), m('h3', '资源奖励'), m('p.helpText', '光玉从你的账户支付，经验由系统发放。负数将从领奖者扣除并销毁。'),
         (task.reward || []).map((item, index) => m('.Community-term', [select(item.currency_id, [['', '选择资源'], ...this.meta.resources.map(resource => [resource.id, resource.name])], value => item.currency_id = value, '奖励资源'), input(item.delta, value => item.delta = value, { inputmode: 'numeric', placeholder: '整数，可填负数', 'aria-label': '资源变化量' }), button('删除', () => task.reward.splice(index, 1))])),
         button('+ 添加资源', () => task.reward.push({ currency_id: this.meta.resources.find(resource => !task.reward.some(item => item.currency_id === resource.id))?.id || '', delta: '1' })),
-        m('.Community-row', [label('每周期最多领取次数', input(task.max_claims_per_period, value => task.max_claims_per_period = value, { inputmode: 'numeric' }), '0表示不限；每轮仍须有新的可累计进度。'), label('可参与用户', select(task.audience?.kind || 'registered', [['registered', '全部已注册用户'], ['groups', '指定用户组']], value => task.audience = { kind: value, group_ids: [] }, '参与用户'))]), task.audience?.kind === 'groups' && checks(this.meta.groups, task.audience.group_ids.map(Number), value => task.audience.group_ids = value.map(Number), '参与用户组'),
-        m('details.Community-detail', [m('summary', '帖子变化与完成状态'), label('条件后来不满足时', select(task.policies.completion, [['retain', '保留完成'], ['invalidate', '撤销完成']], value => { task.policies.completion = value; if (value === 'retain') task.policies.reward = 'retain'; }, '完成策略')), task.policies.completion === 'invalidate' && label('撤销完成时', select(task.policies.reward, [['retain', '保留奖励'], ['reverse', '冲正奖励']], value => task.policies.reward = value, '奖励策略'), '冲正需要领奖者有足够余额。')]),
+        m('.Community-row', [label('可参与用户', select(task.audience?.kind || 'registered', [['registered', '全部已注册用户'], ['groups', '指定用户组']], value => task.audience = { kind: value, group_ids: [] }, '参与用户'))]), task.audience?.kind === 'groups' && checks(this.meta.groups, task.audience.group_ids.map(Number), value => task.audience.group_ids = value.map(Number), '参与用户组'),
+        m('p.helpText', '每周期最多领取一次；无周期任务只能领取一次。领取后的完成与奖励不因帖子变化自动撤销。'),
       ],
       m('.Community-actions', [m('button.Button.Button--primary', { type: 'submit', disabled: this.busy }, this.busy ? '保存中…' : '保存草稿'), !frozen && button('保存并发布', () => this.saveTask(true), false, this.busy)]),
     ]);
