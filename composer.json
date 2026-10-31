@@ -1,0 +1,35 @@
+{
+  "name": "local/good-community",
+  "description": "Community tasks, ratings, whole-unit resources and achievements for Flarum 1.8",
+  "type": "flarum-extension",
+  "license": "MIT",
+  "require": {
+    "php": "^8.3",
+    "flarum/core": "^1.8"
+  },
+  "autoload": {
+    "psr-4": {
+      "Local\\GoodCommunity\\": "src/"
+    }
+  },
+  "extra": {
+    "flarum-extension": {
+      "title": "Good Community",
+      "optional-dependencies": [
+        "local/custom-profile"
+      ],
+      "icon": {
+        "color": "#fff",
+        "backgroundColor": "#526b67",
+        "name": "fas fa-tasks"
+      }
+    }
+  },
+  "minimum-stability": "stable",
+  "prefer-stable": true,
+  "suggest": {
+    "flarum/tags": "Board-tag conditions and event scopes",
+    "flarum/likes": "Current post-like conditions",
+    "local/custom-profile": "First successful self-publication condition (PublicationFacts contract)"
+  }
+}

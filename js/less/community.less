@@ -1,0 +1,93 @@
+.Community-page { max-width: 1080px; padding-top: 28px; padding-bottom: 50px; }
+.Community-panel { max-width: 1080px; margin: 0 auto; padding: 20px; }
+.Community-toolbar,.Community-row,.Community-term,.Community-actions,.Community-cardHeading,.Community-cardFoot,.Community-meta,.Community-listRow,.Community-rewardLine { display: flex; align-items: center; gap: 12px; }
+.Community-toolbar { justify-content: space-between; margin: 18px 0; }
+.Community-toolbar h1,.Community-toolbar h2,.Community-cardHeading h3 { margin: 0; }
+.Community-row,.Community-term,.Community-actions,.Community-meta { flex-wrap: wrap; }
+.Community-row { margin-bottom: 12px; align-items: flex-start; }
+.Community-row > .FormControl,.Community-row > .Form-group { flex: 1 1 170px; min-width: 0; }
+.Community-grow { flex: 1; min-width: 0; }
+.Community-resourceIcon { display: inline-block; width: 1.15em; height: 1.15em; object-fit: contain; vertical-align: middle; margin-right: .4em; }
+.Community-editor .Form-group > label,.Community-panel .Form-group > label { display: block; width: 100%; }
+.Community-page .Form-group label > .FormControl,.Community-panel .Form-group label > .FormControl { margin-top: 6px; font-weight: normal; }
+.Community-listRow { padding: 16px 0; border-bottom: 1px solid @control-bg; flex-wrap: wrap; }
+.Community-listRow h3 { font-size: 16px; margin: 0 0 6px; overflow-wrap: anywhere; }
+.Community-listRow p { margin: 0; }
+.Community-listRow > .Community-grow { flex-basis: 240px; }
+.Community-tabs { display: flex; gap: 8px; flex-wrap: wrap; border-bottom: 1px solid @control-bg; padding-bottom: 14px; }
+.Community-taskList { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 16px; margin: 20px 0; }
+.Community-taskList--compact { grid-template-columns: repeat(3,minmax(0,1fr)); }
+.Community-taskCard,.Community-card { border: 1px solid @control-bg; background: @body-bg; border-radius: @border-radius; padding: 22px; }
+a.Community-taskCard { display: block; color: @text-color; text-decoration: none; transition: border-color .15s; }
+a.Community-taskCard:hover { border-color: @primary-color; }
+.Community-taskCard h3 { font-size: 17px; }
+.Community-taskCard p { color: @muted-color; line-height: 1.65; min-height: 24px; }
+.Community-cardHeading { align-items: flex-start; justify-content: space-between; }
+.Community-cardFoot { color: @muted-color; font-size: 12px; justify-content: space-between; flex-wrap: wrap; }
+.Community-status { font-size: 12px; white-space: nowrap; background: @control-bg; border-radius: 4px; padding: 3px 8px; }
+.Community-home { margin-bottom: 24px; }
+.Community-home h2 { font-size: 19px; }
+.Community-home .Community-taskCard { padding: 16px; }
+.Community-taskHeader { margin: 20px 0 26px; }
+.Community-taskHeader h1 { font-size: 28px; margin-bottom: 12px; }
+.Community-meta { color: @muted-color; font-size: 13px; }
+.Community-detailGrid { display: grid; grid-template-columns: minmax(0,1fr) 300px; gap: 20px; align-items: start; }
+.Community-card h2 { font-size: 19px; margin: 0 0 18px; }
+.Community-condition { display: flex; gap: 12px; padding: 12px 0; align-items: flex-start; }
+.Community-conditionMark { color: @primary-color; font-size: 19px; min-width: 24px; }
+.Community-condition small { display: block; color: @muted-color; margin-top: 5px; }
+.Community-condition details { margin-top: 8px; }
+.Community-condition summary { color: @muted-color; font-size: 12px; cursor: pointer; }
+.Community-rewardLine { justify-content: space-between; margin: 16px 0; font-size: 17px; }
+.Community-reward .Button--primary { width: 100%; margin-top: 8px; }
+.is-positive { color: @primary-color; }
+.is-negative { color: #b74c48; }
+.Community-error,.Community-success,.Community-note { border-radius: 4px; padding: 12px; margin: 12px 0; line-height: 1.6; }
+.Community-error { background: fade(#c44545,12%); color: #b44646; }
+.Community-success { background: fade(@primary-color,10%); color: @primary-color; }
+.Community-note { background: @control-bg; }
+.Community-empty { color: @muted-color; padding: 36px 16px; text-align: center; }
+.Community-editor { max-width: 900px; margin: 0 auto; }
+.Community-editor fieldset { border: 0; border-top: 1px solid @control-bg; padding: 16px 0; margin-top: 20px; }
+.Community-editor legend { font-size: 16px; width: auto; margin-bottom: 12px; }
+.Community-editor h3 { margin-top: 28px; }
+.Community-clause { border: 1px solid @control-bg; border-left: 3px solid @primary-color; padding: 16px; margin: 12px 0; border-radius: 4px; }
+.Community-clauseHeading { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
+.Community-atom { border-top: 1px solid @control-bg; padding: 14px 0; }
+.Community-term { align-items: center; margin-bottom: 10px; }
+.Community-term > .FormControl { flex: 1 1 130px; width: 130px; min-width: 0; }
+.Community-term > .checkbox { margin: 0; white-space: nowrap; }
+.Community-termNumber { color: @muted-color; min-width: 36px; }
+.Community-detail { border: 1px solid @control-bg; border-radius: 4px; padding: 12px; margin: 12px 0; }
+.Community-detail > summary { cursor: pointer; font-weight: 600; }
+.Community-detail[open] > summary { margin-bottom: 16px; }
+.Community-or { text-align: center; color: @muted-color; margin: 10px 0; font-size: 13px; }
+.Community-checks { display: flex; flex-wrap: wrap; gap: 10px 24px; padding: 8px 0 14px; }
+.Community-checks .checkbox { margin: 0; }
+.Community-actions { position: sticky; bottom: 0; padding: 16px 0; background: @body-bg; border-top: 1px solid @control-bg; margin-top: 24px; z-index: 1; }
+.Community-total { text-align: right; min-width: 110px; }
+.Community-total strong { display: block; font-size: 22px; }
+.Community-total small { color: @muted-color; }
+.Community-balance { font-size: 32px; }
+.Community-userPicker { position: relative; margin-bottom: 16px; }
+.Community-suggestions { position: absolute; background: @body-bg; border: 1px solid @control-bg; padding: 6px; list-style: none; width: 100%; z-index: 5; box-shadow: 0 4px 12px fade(#000,12%); }
+.Community-suggestions .Button { width: 100%; text-align: left; }
+.Community-embeddedCard { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; border: 1px solid @control-bg; padding: 14px; margin: 8px 0; border-radius: 4px; }
+.Community-embeddedCard > strong { flex: 1; }
+.Community-taskEmbed { display: block; }
+@media(max-width: 767px) {
+  .Community-page { padding: 18px 14px 36px; }
+  .Community-panel { padding: 12px 0; }
+  .Community-taskList,.Community-taskList--compact,.Community-detailGrid { grid-template-columns: minmax(0,1fr); }
+  .Community-card,.Community-taskCard { padding: 16px; }
+  .Community-taskHeader h1 { font-size: 23px; }
+  .Community-term > .FormControl { flex-basis: 140px; }
+  .Community-clause { padding: 12px; }
+  .Community-tabs .Button { flex: 1; }
+  .Community-listRow { gap: 8px; }
+}
+.Community-tableWrap { overflow-x: auto; }
+.Community-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.Community-table th,.Community-table td { text-align: left; padding: 12px 10px; border-bottom: 1px solid @control-bg; vertical-align: top; }
+.Community-tipRecords { width: 100%; display: block; padding: 8px 0; font-size: 12px; color: @muted-color; }
+.Community-tipRecords p { margin: 5px 0; }
